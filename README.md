@@ -172,10 +172,10 @@ All parameters written by `--mode setup`:
 |--------------------|-------|-----------------------------------|
 | `RNGFND1_TYPE`     | 10    | MAVLink rangefinder (from RPi5)   |
 | `RNGFND1_ORIENT`   | 25    | Downward facing                   |
-| `RNGFND1_MIN_CM`   | 30    | Minimum range 0.3 m              |
-| `RNGFND1_MAX_CM`   | 800   | Maximum range 8.0 m              |
-| `RNGFND1_GNDCLR`   | 15    | Ground clearance offset 15 cm    |
-| `EK3_RNG_USE_HGT`  | 70    | Use rangefinder below 70% range  |
+| `RNGFND1_MIN_CM`   | 30    | Minimum range 0.3 m               |
+| `RNGFND1_MAX_CM`   | 800   | Maximum range 8.0 m               |
+| `RNGFND1_GNDCLR`   | 15    | Ground clearance offset 15 cm     |
+| `EK3_RNG_USE_HGT`  | 70    | Use rangefinder below 70% range   |
 
 ### AutoTune (PIDs reset to default before tuning)
 | Parameter          | Value  | Purpose                          |
@@ -204,14 +204,14 @@ All parameters written by `--mode setup`:
 | Parameter          | Value | Purpose                           |
 |--------------------|-------|-----------------------------------|
 | `LOIT_SPEED`       | 500   | Max 5 m/s in Loiter               |
-| `LOIT_ACC_MAX`     | 250   | Max Loiter acceleration            |
+| `LOIT_ACC_MAX`     | 250   | Max Loiter acceleration           |
 | `RTL_ALT`          | 400   | Climb to 4 m before RTL           |
 | `RTL_LOIT_TIME`    | 3000  | Hover 3 s at home before landing  |
 | `ARMING_CHECK`     | 1     | Enable all arming checks          |
 | `DISARM_DELAY`     | 10    | 10 s disarm delay after landing   |
-| `MOT_SPIN_ARM`     | 0.10  | Minimum spin when armed            |
-| `MOT_SPIN_MIN`     | 0.15  | Minimum spin in flight             |
-| `MOT_THST_HOVER`   | 0.35  | Hover throttle estimate            |
+| `MOT_SPIN_ARM`     | 0.10  | Minimum spin when armed           |
+| `MOT_SPIN_MIN`     | 0.15  | Minimum spin in flight            |
+| `MOT_THST_HOVER`   | 0.35  | Hover throttle estimate           |
 
 ---
 
