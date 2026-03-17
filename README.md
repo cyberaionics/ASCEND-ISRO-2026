@@ -91,8 +91,8 @@ pip3 install pymavlink pyserial
 
 ### Clone ASCEND
 ```bash
-git clone <repo-url>
-cd <repo>/ascend
+git clone https://github.com/cyberaionics/ASCEND-ISRO-2026.git
+cd ASCEND-ISRO-2026/ascend
 ```
 
 ---
