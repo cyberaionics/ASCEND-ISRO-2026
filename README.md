@@ -40,14 +40,14 @@ stable takeoff, 5-minute hover, controlled landing, and low-battery failsafe.
  │   │ TXD     ├───────────────┤ RXD (GPIO15) │           │
  │   │ RXD     ├───────────────┤ TXD (GPIO14) │           │
  │   └─────────┘               └──────┬───────┘           │
- │                                     │ USB              │
- │                                     │                  │
+ │                                    │ USB               │
+ │                                    │                   │
  │   Pixhawk 2.4.8             ┌──────┴───────┐           │
- │   ┌──────────┐              │ USB-C Port │             │
- │   │ USB      ├──────────────┤ RPi5       │             │
- │   │          │              └────────────┘             │
- │   │ RC IN    ├──┐                                      │
- │   └──────────┘  │                                      │
+ │   ┌──────────┐              │ USB-C Port   │           │
+ │   │ USB      ├──────────────┤ RPi5         │           │
+ │   │          │              └──────────────┘           │
+ │   │ RC IN    ├───┐                                     │
+ │   └──────────┘   │                                     │
  │                  │   R88 ELRS Receiver                 │
  │                  │   ┌─────────────┐                   │
  │                  └───┤ SBUS OUT    │                   │
@@ -120,50 +120,8 @@ python3 -m ascend.scheduler --mode fly
 
 ---
 
-## 5. Day-by-Day Procedure
 
-### Day 1 — Bench Work (indoors, props OFF)
-
-1. Install battery, power Pixhawk + RPi5.
-2. SSH into RPi5 or connect a monitor/keyboard.
-3. Run `--mode check`:
-   - Verify PID values are read (all default → AutoTune needed).
-   - Confirm vibration levels are EXCELLENT / GOOD.
-   - Confirm TF-02 reads valid distances (point at ceiling/floor).
-4. Run `--mode setup`:
-   - Writes all parameters (rangefinder, failsafe, autotune, flight).
-   - Verify every line shows `[ OK ]`.
-5. Power-cycle the Pixhawk to load new parameters.
-6. Re-run `--mode check` to confirm parameters took effect.
-
-### Day 2 — AutoTune (outdoors, open field)
-
-1. Props ON, fly area clear, battery fully charged.
-2. Start `--mode autotune` on RPi5 (SSH from laptop over Wi-Fi).
-3. Arm and take off manually in AltHold mode (use TX).
-4. Hover at 4–5 m altitude in calm air.
-5. Switch to AutoTune via RC switch (the monitor will report it).
-6. Wait for "AutoTune COMPLETE" message in the terminal.
-7. Switch back to AltHold, land, disarm.
-8. Check `autotune_results_*.json` for saved PID values.
-9. If not completed → charge battery, repeat from step 3.
-
-### Day 3 — Autonomous Hover Flight
-
-1. Ensure no TX is powered on (TX override will engage STABILIZE).
-2. Start `--mode fly` on RPi5.
-3. The drone will:
-   - Arm in GUIDED mode
-   - Take off to 4 m
-   - Switch to LOITER and hover for 5 minutes
-   - RTL to home position
-   - Land and disarm
-4. Monitor telemetry on the laptop (UDP port 14550).
-5. If anything goes wrong: power on the TX → instant STABILIZE override.
-
----
-
-## 6. Parameter Reference
+## 5. Parameter Reference
 
 All parameters written by `--mode setup`:
 
@@ -215,7 +173,7 @@ All parameters written by `--mode setup`:
 
 ---
 
-## 7. Troubleshooting
+## 6. Troubleshooting
 
 | Symptom                                    | Likely Cause                       | Fix                                            |
 |--------------------------------------------|------------------------------------|-------------------------------------------------|
@@ -234,7 +192,7 @@ All parameters written by `--mode setup`:
 
 ---
 
-## 8. Architecture Overview
+## 7. Architecture Overview
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -268,7 +226,7 @@ All parameters written by `--mode setup`:
 
 ---
 
-## 9. File Structure
+## 8. File Structure
 
 ```
 ascend/
