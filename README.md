@@ -256,3 +256,5 @@ ascend/
 ## License
 
 Internal use — Bayes Frontier, IIT Dharwad. IRoC-U 2026 competition entry.
+
+This documentation was written with the assistance of generative AI tools and was reviewed, tested, and validated by our engineering team.
