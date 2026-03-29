@@ -110,6 +110,9 @@ class StateMachine:
         self._emergency_land_sent: bool = False
         self._takeoff_sent: bool = False
 
+        # Crash safety: force-disarm watchdog
+        self._crash_land_since: Optional[float] = None
+
     # ── Public API ─────────────────────────────────────────────────────
 
     def get_telemetry(self) -> dict:
@@ -185,8 +188,11 @@ class StateMachine:
                 time.sleep(Config.MAIN_LOOP_INTERVAL)
 
         except KeyboardInterrupt:
-            Logger.warn("Ctrl+C — sending LAND and stopping")
+            Logger.warn("Ctrl+C — sending LAND + DISARM")
+            self._px.clear_rc_override()
             self._px.set_mode("LAND")
+            time.sleep(0.5)
+            self._force_disarm()
         finally:
             self._running = False
 
@@ -246,7 +252,7 @@ class StateMachine:
             return
 
         autonomous_requested = ch8 < 1300   # switch DOWN = autonomous
-        manual_requested = ch8 > 1700       # switch UP   = manual
+        manual_requested = ch8 > 2000       # switch UP   = manual
 
         if manual_requested and not self._manual_mode:
             Logger.warn(f"RC8 MANUAL MODE (ch8={ch8}) → STABILIZE")
@@ -353,7 +359,7 @@ class StateMachine:
                 Logger.ok(f"LIFTOFF detected at throttle={self._ramp_throttle} alt={alt:.2f}m")
             else:
                 self._ramp_throttle += 1
-                self._ramp_throttle = min(self._ramp_throttle, 1900)
+                self._ramp_throttle = min(self._ramp_throttle, 2000)
                 Logger.info(f"Ramping... alt={alt:.2f}m throttle={self._ramp_throttle}")
                 self._px.send_rc_override(
                     roll=roll, pitch=pitch, throttle=self._ramp_throttle
@@ -437,6 +443,7 @@ class StateMachine:
         """LAND — controlled descent, wait for touchdown."""
         self._px.set_mode("LAND")
         self._check_touchdown()
+        self._check_crash_disarm()
 
     def _state_emergency(self) -> None:
         """EMERGENCY — immediate LAND from any state."""
@@ -445,6 +452,49 @@ class StateMachine:
             self._px.clear_rc_override()
             self._emergency_land_sent = True
         self._check_touchdown()
+        self._check_crash_disarm()
+
+    # ── Force Disarm (Crash Safety) ────────────────────────────────────
+
+    def _force_disarm(self) -> None:
+        """Force-disarm the drone — stops ALL motors immediately.
+
+        Uses the existing PixhawkLink.disarm() method. Called when:
+          - Ctrl+C abort
+          - Crash watchdog triggers (stuck on ground with props spinning)
+          - Cleanup / shutdown
+        """
+        Logger.warn("FORCE DISARM — stopping motors")
+        self._px.clear_rc_override()
+        self._px.disarm()
+
+    def _check_crash_disarm(self) -> None:
+        """Watchdog: if in LAND/EMERGENCY and stuck near ground, force-disarm.
+
+        Prevents props from spinning after a crash/tip-over. If TF-02 reads
+        below CRASH_DISARM_ALT_M for longer than CRASH_DISARM_TIMEOUT, the
+        drone is force-disarmed regardless of FC landed_state.
+        """
+        if self._state not in (State.LAND, State.EMERGENCY):
+            self._crash_land_since = None
+            return
+
+        tf02_m = self._tf02.distance_m
+        if tf02_m is not None and tf02_m < Config.CRASH_DISARM_ALT_M:
+            if self._crash_land_since is None:
+                self._crash_land_since = time.time()
+            elif time.time() - self._crash_land_since >= Config.CRASH_DISARM_TIMEOUT:
+                Logger.warn(
+                    f"Crash watchdog: alt={tf02_m:.2f}m for "
+                    f">{Config.CRASH_DISARM_TIMEOUT:.0f}s — force disarming"
+                )
+                self._force_disarm()
+                self._crash_land_since = None
+                self._safety.reset()
+                self._transition(State.IDLE)
+                self._running = False
+        else:
+            self._crash_land_since = None
 
     # ── Touchdown Detection ────────────────────────────────────────────
 
@@ -607,6 +657,14 @@ class Scheduler:
 
     def _cleanup(self) -> None:
         Logger.info("Cleaning up …")
+        # Force-disarm as safety net — ensure motors stop
+        if self._pixhawk and self._pixhawk.connected:
+            try:
+                self._pixhawk.clear_rc_override()
+                self._pixhawk.disarm()
+                Logger.warn("Safety disarm sent during cleanup")
+            except Exception:
+                pass
         for t in self._threads:
             if hasattr(t, "stop"):
                 t.stop()
@@ -617,6 +675,13 @@ class Scheduler:
         Logger.ok("Shutdown complete")
 
     def _shutdown_handler(self, signum: int, frame: object) -> None:
+        # Best-effort disarm before raising KeyboardInterrupt
+        if self._pixhawk and self._pixhawk.connected:
+            try:
+                self._pixhawk.clear_rc_override()
+                self._pixhawk.disarm()
+            except Exception:
+                pass
         raise KeyboardInterrupt
 
 
