@@ -351,3 +351,73 @@ class PixhawkLink:
                     start_stop=1,
                 )
         Logger.info(f"Requested data streams at {rate_hz} Hz")
+    def send_velocity(self, vx: float, vy: float, vz: float) -> None:
+        """Send body-frame velocity command for GUIDED_NOGPS mode.
+
+        Args:
+            vx: Forward velocity in m/s (NED frame).
+            vy: Right velocity in m/s (NED frame).
+            vz: Down velocity in m/s (negative = up in NED).
+        """
+        if self._conn is None:
+            return
+        with self._send_lock:
+            self._conn.mav.set_position_target_local_ned_send(
+                time_boot_ms=int(time.time() * 1000) & 0xFFFFFFFF,
+                target_system=self._conn.target_system,
+                target_component=self._conn.target_component,
+                coordinate_frame=mavutil.mavlink.MAV_FRAME_BODY_OFFSET_NED,
+                type_mask=0b0000111111000111,  # ignore position & accel, use velocity only
+                x=0, y=0, z=0,
+                vx=vx, vy=vy, vz=vz,
+                afx=0, afy=0, afz=0,
+                yaw=0, yaw_rate=0,
+            )
+    def send_rc_override(self, roll: int = 1500, pitch: int = 1500,
+                          throttle: int = 1500, yaw: int = 1500) -> None:
+        """Send fake RC PWM override to Pixhawk.
+
+        Args:
+            roll:     PWM 1000-2000 (1500 = neutral)
+            pitch:    PWM 1000-2000 (1500 = neutral)
+            throttle: PWM 1000-2000 (1500 = mid, 1600 = climb)
+            yaw:      PWM 1000-2000 (1500 = neutral)
+        """
+        if self._conn is None:
+            return
+        with self._send_lock:
+            self._conn.mav.rc_channels_override_send(
+                target_system=self._conn.target_system,
+                target_component=self._conn.target_component,
+                chan1_raw=roll,
+                chan2_raw=pitch,
+                chan3_raw=throttle,
+                chan4_raw=yaw,
+                chan5_raw=0,
+                chan6_raw=0,
+                chan7_raw=0,
+                chan8_raw=0,
+            )
+
+    def clear_rc_override(self) -> None:
+        """Release all RC overrides — hands full control back to the RC transmitter.
+
+        Sends 0 on all channels which tells ArduCopter to stop using
+        companion-computer RC values and use the real TX instead.
+        """
+        if self._conn is None:
+            return
+        with self._send_lock:
+            self._conn.mav.rc_channels_override_send(
+                target_system=self._conn.target_system,
+                target_component=self._conn.target_component,
+                chan1_raw=0,
+                chan2_raw=0,
+                chan3_raw=0,
+                chan4_raw=0,
+                chan5_raw=0,
+                chan6_raw=0,
+                chan7_raw=0,
+                chan8_raw=0,
+            )
+        Logger.info("RC override cleared — TX has full control")

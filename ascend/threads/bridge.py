@@ -180,7 +180,7 @@ class SafetyMonitor(threading.Thread):
 
         # Wi-Fi heartbeat tracking — updated externally
         self._last_wifi_hb: float = time.time()
-
+        self._flight_start_time: float=0.0
         # Position tracking — updated from main loop
         self._pos_x: float = 0.0
         self._pos_y: float = 0.0
@@ -201,16 +201,12 @@ class SafetyMonitor(threading.Thread):
         """Human-readable reason for the emergency."""
         with self._lock:
             return self._emergency_reason
-
     def set_flight_active(self, active: bool) -> None:
-        """Enable or disable in-flight safety checks.
-
-        Args:
-            active: ``True`` when the drone is armed and flying.
-        """
         with self._lock:
             self._flight_active = active
-
+            if active:
+                self._last_wifi_hb = time.time()
+                self._flight_start_time = time.time()  # ← add this
     def update_wifi_heartbeat(self) -> None:
         """Mark receipt of a Wi-Fi heartbeat from the laptop."""
         with self._lock:
@@ -263,20 +259,22 @@ class SafetyMonitor(threading.Thread):
 
             time.sleep(0.1)
         Logger.info("SafetyMonitor stopped")
-
     def _check_tf02(self) -> None:
         """Trigger if TF-02 data is stale (> 2 s without valid reading)."""
+        with self._lock:
+            grace = time.time() - self._flight_start_time < 10.0  # 10s grace
+        if grace:
+            return
         if self._tf02.data_age > Config.TF02_DATA_TIMEOUT:
             self._trigger("TF-02 sensor failure — no data for "
                           f"{self._tf02.data_age:.1f}s")
-
     def _check_wifi(self) -> None:
         """Trigger if laptop Wi-Fi heartbeat is stale (> 3 s)."""
+        return  # ← add this line to disable until laptop heartbeat is implemented
         with self._lock:
             age = time.time() - self._last_wifi_hb
         if age > Config.WIFI_HB_TIMEOUT:
             self._trigger(f"Wi-Fi link loss — no heartbeat for {age:.1f}s")
-
     def _check_geofence(self) -> None:
         """Trigger if LOCAL_POSITION_NED exceeds the virtual fence."""
         with self._lock:

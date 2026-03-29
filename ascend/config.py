@@ -16,7 +16,7 @@ class Config:
     PIXHAWK_PORT: str = "/dev/ttyACM0"
     PIXHAWK_BAUD: int = 921600
 
-    TF02_PORT: str = "/dev/serial0"
+    TF02_PORT: str = "/dev/ttyAMA0"
     TF02_BAUD: int = 115200
 
     # ── TF-02 Frame Constants ──────────────────────────────────────────
@@ -42,7 +42,7 @@ class Config:
     PREFLIGHT_TIMEOUT: float = 30.0        # arming attempt window
 
     # ── Flight Parameters ──────────────────────────────────────────────
-    TARGET_ALT_M: float = 4.0              # hover altitude (metres)
+    TARGET_ALT_M: float = 1.0              # hover altitude (metres)
     ALT_TOLERANCE_M: float = 0.2           # ±0.2 m considered "at altitude"
     ALT_STABLE_TIME: float = 2.0           # stable for 2 s → transition
     HOVER_DURATION: float = 300.0          # 5 minutes
@@ -58,7 +58,7 @@ class Config:
     TF02_DATA_TIMEOUT: float = 2.0         # no reading → emergency
     WIFI_HB_TIMEOUT: float = 3.0           # no laptop heartbeat → emergency
     LOW_BATTERY_VOLT: float = 14.0         # 3.5 V / cell
-    CRITICAL_BATTERY_VOLT: float = 13.2    # 3.3 V / cell
+    CRITICAL_BATTERY_VOLT: float = 9.0     # updated threshold
 
     # ── Vibration Thresholds (m/s²) ────────────────────────────────────
     VIB_EXCELLENT: float = 15.0
@@ -69,9 +69,10 @@ class Config:
     RC_PWM_MIN: int = 1000
     RC_PWM_MAX: int = 2000
     RC_INVALID_VALS: tuple = (0, 65535)
+    RC8_OPTION: int = 8  # <--- ADD THIS LINE
 
     # ── Telemetry Streaming ────────────────────────────────────────────
-    LAPTOP_IP: str = "192.168.4.1"         # laptop hotspot gateway
+    LAPTOP_IP: str = "255.255.255.255"         # laptop hotspot gateway
     TELEMETRY_PORT: int = 14550
 
     # ── Health-Check Durations (seconds) ───────────────────────────────
@@ -117,8 +118,8 @@ class Config:
         "FS_GCS_TIMEOUT":  3,
         "FS_THR_ENABLE":   0,
         "BATT_FS_LOW_ACT": 1,
-        "BATT_LOW_VOLT":   14.0,
-        "BATT_CRT_VOLT":   13.2,
+        "BATT_LOW_VOLT":   10.4,
+        "BATT_CRT_VOLT":   10,
     }
 
     # ── Pixhawk Parameters — Flight ───────────────────────────────────
@@ -135,12 +136,18 @@ class Config:
     }
 
     # ── ArduCopter Flight-Mode Numbers ─────────────────────────────────
-    MODE_MAP: dict = {
-        "STABILIZE":  0,
-        "ALT_HOLD":   2,
-        "LOITER":     5,
-        "RTL":        6,
-        "LAND":       9,
-        "GUIDED":    15,
-        "AUTOTUNE":  22,
+    MODE_MAP = {
+        "STABILIZE":    0,
+        "ACRO":         1,
+        "ALT_HOLD":     2,
+        "AUTO":         3,
+        "GUIDED":       4,
+        "LOITER":       5,
+        "RTL":          6,
+        "CIRCLE":       7,
+        "LAND":         9,
+        "DRIFT":        11,
+        "SPORT":        13,
+        "GUIDED_NOGPS": 20,  # ← add this
+        "AUTOTUNE":     17,
     }
