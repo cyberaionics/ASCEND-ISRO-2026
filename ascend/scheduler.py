@@ -300,30 +300,59 @@ class StateMachine:
         self._transition(State.ARM)
 
     def _state_arm(self) -> None:
-        """ARM — set STABILIZE mode, send arm command, wait for confirmation."""
+        """ARM — set STABILIZE mode, send arm command, wait for confirmation.
+
+        Retries the arm command every 2 seconds because ArduCopter may
+        reject the first attempt if the mode switch hasn't settled or
+        pre-arm checks are still running.
+        """
         elapsed = time.time() - self._state_enter_time
 
-        # On first entry: set mode and arm
+        # Phase 1 (first 0.1s): send STABILIZE mode command
         if elapsed < 0.1:
-            Logger.info("ARM: setting STABILIZE mode and arming …")
+            Logger.info("ARM: setting STABILIZE mode …")
             self._px.set_mode("STABILIZE")
-            time.sleep(0.5)
-            self._px.arm()
             return
 
-        # Wait for armed status
+        # Phase 2 (0.1–1.0s): wait for mode to settle, poll for confirmation
+        if elapsed < 1.0:
+            self._poll_mavlink()
+            return
+
+        # Phase 3: verify mode is STABILIZE before arming
         self._poll_mavlink()
+
         if self._armed:
             Logger.ok("Drone ARMED — STABILIZE mode confirmed")
             self._flight_start = time.time()
             self._transition(State.TAKEOFF)
             return
 
+        # Retry arm command every 2 seconds
+        time_since_entry = elapsed
+        retry_interval = 2.0
+        should_send_arm = (
+            time_since_entry < 1.0 + 0.1  # first arm at ~1s
+            or int(time_since_entry / retry_interval) != int(
+                (time_since_entry - Config.MAIN_LOOP_INTERVAL) / retry_interval
+            )
+        )
+        if should_send_arm:
+            if self._mode_name != "STABILIZE":
+                Logger.warn(
+                    f"ARM: mode is {self._mode_name}, resending STABILIZE …"
+                )
+                self._px.set_mode("STABILIZE")
+                time.sleep(0.3)
+            Logger.info(f"ARM: sending arm command (attempt at {elapsed:.1f}s) …")
+            self._px.arm()
+
         # Timeout
         if elapsed > Config.ARM_TIMEOUT_S:
             Logger.error(
                 f"Arming FAILED within {Config.ARM_TIMEOUT_S:.0f}s — "
-                "transitioning to DISARM"
+                "check Mission Planner HUD for pre-arm failures. "
+                "Transitioning to DISARM"
             )
             self._transition(State.DISARM)
 
@@ -651,6 +680,58 @@ class Scheduler:
         # Let sensors stabilise
         Logger.info("Waiting 3s for sensor stabilisation …")
         time.sleep(3.0)
+
+        # ── Sensor data verification ──────────────────────────────────
+        Logger.info("Verifying sensor data streams …")
+
+        # TF-02
+        if self._tf02.is_alive():
+            tf02_m = self._tf02.distance_m
+            if tf02_m is not None:
+                Logger.ok(f"TF-02: alive, reading {tf02_m:.2f} m")
+            else:
+                Logger.warn("TF-02: thread alive but NO DATA yet")
+        else:
+            Logger.error("TF-02: thread NOT alive — check /dev/ttyAMA0")
+
+        # ESP32-CAM flow
+        if self._esp32_cam is not None:
+            if self._esp32_cam.is_alive():
+                if self._esp32_cam.data_age < 1.0:
+                    dx, dy, q = self._esp32_cam.get_flow()
+                    Logger.ok(f"ESP32-CAM: alive, quality={q}, "
+                              f"flow=({dx},{dy}), age={self._esp32_cam.data_age:.2f}s")
+                else:
+                    Logger.warn(
+                        f"ESP32-CAM: thread alive but data stale "
+                        f"(age={self._esp32_cam.data_age:.1f}s) — "
+                        "check UART2 wiring and ESP32 firmware"
+                    )
+            else:
+                Logger.error(
+                    "ESP32-CAM: thread DIED — failed to open /dev/ttyAMA2. "
+                    "VIO ESP32 pipeline will be inactive."
+                )
+        else:
+            Logger.warn("ESP32-CAM: not started (init failed)")
+
+        # ORB flow
+        if self._orb_flow is not None:
+            if self._frame_reader is not None and self._frame_reader.is_alive():
+                if self._orb_flow.is_alive():
+                    if self._orb_flow.data_age < 2.0:
+                        Logger.ok(f"ORB flow: alive, quality={self._orb_flow.quality}")
+                    else:
+                        Logger.warn(
+                            "ORB flow: thread alive but data stale — "
+                            "check UART3 wiring (ttyAMA3 @ 921600)"
+                        )
+                else:
+                    Logger.warn("ORB flow: thread DIED")
+            else:
+                Logger.warn("ORB flow: frame reader not alive — no raw frames")
+        else:
+            Logger.warn("ORB flow: not started — VIO will run ESP32-only")
 
         # Safety monitor
         safety = SafetyMonitor(self._tf02, self._pixhawk)

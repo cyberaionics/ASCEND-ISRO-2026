@@ -109,16 +109,22 @@ class VIOStabilizer(threading.Thread):
         self._running.clear()
 
     def reset(self) -> None:
-        """Reset both pipeline I-terms and velocity state."""
+        """Reset both pipeline I-terms, velocity state, AND prev_time.
+
+        Called on state transitions (e.g. TAKEOFF → HOVER) to ensure
+        the first pipeline call after reset doesn't see a stale dt.
+        """
         self._esp_integral_x = 0.0
         self._esp_integral_y = 0.0
         self._esp_prev_vx = 0.0
         self._esp_prev_vy = 0.0
+        self._esp_prev_time = 0.0
         self._orb_integral_x = 0.0
         self._orb_integral_y = 0.0
         self._orb_prev_vx = 0.0
         self._orb_prev_vy = 0.0
-        Logger.info("VIO: PID state reset")
+        self._orb_prev_time = 0.0
+        Logger.info("VIO: PID state reset (I-terms + timing cleared)")
 
     # ── Per-Pipeline PID ───────────────────────────────────────────────
 
@@ -332,7 +338,18 @@ class VIOStabilizer(threading.Thread):
 
         # Altitude gate (common to both pipelines)
         alt_m = self._tf02.distance_m
-        if alt_m is None or alt_m < Config.VIO_MIN_ALT_M:
+        if alt_m is None:
+            self._diag_reason = "TF02: no data"
+            self._esp_reset_iterm()
+            self._orb_reset_iterm()
+            with self._lock:
+                self._roll_pwm = 1500
+                self._pitch_pwm = 1500
+                self._is_active = False
+            return
+
+        if alt_m < Config.VIO_MIN_ALT_M:
+            self._diag_reason = f"alt {alt_m:.2f}m < {Config.VIO_MIN_ALT_M}m"
             self._esp_reset_iterm()
             self._orb_reset_iterm()
             with self._lock:
@@ -344,6 +361,31 @@ class VIOStabilizer(threading.Thread):
         # Run each pipeline independently
         esp_result = self._run_pipeline_esp(alt_m, now)
         orb_result = self._run_pipeline_orb(alt_m, now)
+
+        # Track diagnostic reasons
+        if esp_result is None and orb_result is None:
+            reasons = []
+            if self._cam is None:
+                reasons.append("ESP: no source")
+            elif self._cam.data_age > Config.VIO_DATA_TIMEOUT:
+                reasons.append(f"ESP: stale ({self._cam.data_age:.1f}s)")
+            elif self._cam.quality < Config.VIO_MIN_QUALITY:
+                reasons.append(f"ESP: low quality ({self._cam.quality})")
+            else:
+                reasons.append("ESP: init/dt")
+
+            if self._cv is None:
+                reasons.append("ORB: no source")
+            elif self._cv.data_age > Config.VIO_DATA_TIMEOUT:
+                reasons.append(f"ORB: stale ({self._cv.data_age:.1f}s)")
+            elif self._cv.quality < Config.VIO_MIN_QUALITY:
+                reasons.append(f"ORB: low quality ({self._cv.quality})")
+            else:
+                reasons.append("ORB: init/dt")
+
+            self._diag_reason = "; ".join(reasons)
+        else:
+            self._diag_reason = ""
 
         # Fuse and store
         self._fuse_and_store(esp_result, orb_result)
@@ -365,15 +407,38 @@ class VIOStabilizer(threading.Thread):
             f"ORB PID(Kp={Config.ORB_VIO_KP}, Ki={Config.ORB_VIO_KI}, "
             f"Kd={Config.ORB_VIO_KD}) w={Config.ORB_VIO_WEIGHT}"
         )
+
+        self._diag_reason = ""
+        self._diag_last_log = 0.0
+
         while self._running.is_set():
             try:
                 self._compute_corrections()
             except Exception as exc:
                 Logger.warn(f"VIOStabilizer error: {exc}")
+                self._diag_reason = f"exception: {exc}"
                 with self._lock:
                     self._roll_pwm = 1500
                     self._pitch_pwm = 1500
                     self._is_active = False
+
+            # 1 Hz diagnostic logging when VIO is inactive
+            now = time.time()
+            if now - self._diag_last_log >= 1.0:
+                self._diag_last_log = now
+                with self._lock:
+                    active = self._is_active
+                    rpwm = self._roll_pwm
+                    ppwm = self._pitch_pwm
+                if active:
+                    Logger.info(
+                        f"VIO ACTIVE: roll={rpwm} pitch={ppwm}"
+                    )
+                elif self._diag_reason:
+                    Logger.warn(
+                        f"VIO INACTIVE: {self._diag_reason}"
+                    )
+
             time.sleep(Config.VIO_INTERVAL)
 
         with self._lock:
