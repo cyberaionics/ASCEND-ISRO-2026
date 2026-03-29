@@ -1,13 +1,22 @@
 """
-ASCEND Phase 2 — Scheduler & State Machine
-Entry point for all CLI modes. Run as: python3 -m ascend.scheduler --mode <mode>
-Includes VIO hover stabilization via fused ESP32-CAM + RPi5 OpenCV optical flow.
+ASCEND — Scheduler & State Machine
+Entry point for all CLI modes.  Run as: python3 -m ascend --mode <mode>
+
+State machine for the qualification round (Tasks 1–3):
+    IDLE → PREFLIGHT → ARM → TAKEOFF → HOVER → LAND → DISARM → DONE
+
+All flight is in STABILIZE mode using RC override for throttle, roll, pitch.
+VIO corrections are applied from the dual-pipeline VIOStabilizer during
+TAKEOFF and HOVER.  SafetyMonitor.emergency_flag triggers LAND from any state.
+Only the StateMachine writes to PixhawkLink (no concurrent writers aside
+from HeartbeatSender and RangefinderBridge which use the send_lock).
 """
 
 import argparse
 import enum
 import signal
 import sys
+import threading
 import time
 from typing import Optional
 
@@ -18,7 +27,7 @@ from .logger import Logger
 from .hardware.tf02 import TF02Reader
 from .hardware.pixhawk import PixhawkLink
 from .hardware.esp32_cam import ESP32CamReader
-from .hardware.cv_flow import CVFlowProcessor
+from .hardware.esp32_cam_frame import ESP32FrameReader, ORBFlowProcessor
 from .threads.bridge import (
     HeartbeatSender,
     RangefinderBridge,
@@ -36,14 +45,15 @@ from .checks.monitor import AutoTuneMonitor
 # ═══════════════════════════════════════════════════════════════════════════
 
 class State(enum.Enum):
-    """Flight state machine states."""
-    IDLE       = "IDLE"
-    PREFLIGHT  = "PREFLIGHT"
-    TAKEOFF    = "TAKEOFF"
-    HOVER      = "HOVER"
-    RETURN     = "RETURN"
-    LAND       = "LAND"
-    EMERGENCY  = "EMERGENCY"
+    """Flight state machine states (qualification round)."""
+    IDLE      = "IDLE"
+    PREFLIGHT = "PREFLIGHT"
+    ARM       = "ARM"
+    TAKEOFF   = "TAKEOFF"
+    HOVER     = "HOVER"
+    LAND      = "LAND"
+    DISARM    = "DISARM"
+    DONE      = "DONE"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -51,21 +61,18 @@ class State(enum.Enum):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class StateMachine:
-    """Central flight sequencer that runs the Phase 2 hover mission.
+    """Central flight sequencer for the ASCEND qualification round.
 
-    Manages state transitions according to the ASCEND flight-state spec:
-    IDLE → PREFLIGHT → TAKEOFF → HOVER → RETURN → LAND → IDLE.
+    Manages state transitions:
+        IDLE → PREFLIGHT → ARM → TAKEOFF → HOVER → LAND → DISARM → DONE
 
-    Safety is enforced by:
+    Safety:
       - SafetyMonitor.emergency_flag polled every loop tick
-      - RC8 switch: slide DOWN = autonomous (onboard computer)
-                    slide UP   = manual RC control
-      - FS_GCS_ENABLE at the Pixhawk firmware level (if RPi5 crashes)
+      - Ctrl+C → immediate LAND + DISARM
 
-    VIO stabilization:
-      - ESP32-CAM optical flow → VIOStabilizer → roll/pitch corrections
-      - Applied during TAKEOFF and HOVER states via RC override
-      - Corrections are zero when VIO data is invalid (graceful degradation)
+    VIO:
+      - VIOStabilizer provides roll_pwm / pitch_pwm corrections
+      - Applied during TAKEOFF and HOVER via RC override
 
     Args:
         pixhawk: Connected PixhawkLink instance.
@@ -82,81 +89,62 @@ class StateMachine:
         self._safety = safety
         self._vio = vio
         self._state = State.IDLE
-        self._manual_mode: bool = False
         self._running: bool = True
 
         # Timers
-        self._alt_stable_since: Optional[float] = None
+        self._state_enter_time: float = 0.0
         self._hover_start: Optional[float] = None
-        self._touchdown_since: Optional[float] = None
+        self._land_start: Optional[float] = None
 
-        # Cached telemetry
+        # Cached MAVLink telemetry
         self._armed: bool = False
         self._mode: int = 0
         self._mode_name: str = "UNKNOWN"
-        self._altitude_m: float = 0.0
-        self._battery_pct: int = 0
         self._battery_volt: float = 0.0
-        self._vib_x: float = 0.0
-        self._vib_y: float = 0.0
-        self._vib_z: float = 0.0
-        self._landed_state: int = 0
-        self._rc_ch8: int = 0  # latest RC channel 8 PWM value
+        self._battery_pct: int = 0
+
+        # Flight record for mission summary
+        self._flight_start: float = 0.0
+        self._min_alt: float = float("inf")
+        self._max_alt: float = 0.0
+        self._vio_active_ticks: int = 0
+        self._total_ticks: int = 0
 
         # Takeoff ramp state
-        self._ramp_throttle: int = 1100
-        self._ground_alt: float = 0.0
-        self._lifted: bool = False
-        self._hover_throttle: int = 1500
-        self._emergency_land_sent: bool = False
-        self._takeoff_sent: bool = False
-
-        # Crash safety: force-disarm watchdog
-        self._crash_land_since: Optional[float] = None
+        self._ramp_throttle: int = Config.MIN_THROTTLE_PWM
+        self._current_throttle: int = Config.MIN_THROTTLE_PWM
 
     # ── Public API ─────────────────────────────────────────────────────
 
     def get_telemetry(self) -> dict:
         """Build a telemetry dict for the TelemetryStreamer."""
+        alt_m = self._tf02.distance_m
         telem = {
             "state":        self._state.value,
-            "altitude_m":   self._altitude_m,
+            "altitude_m":   alt_m if alt_m is not None else 0.0,
             "battery_pct":  self._battery_pct,
             "battery_volt": self._battery_volt,
             "armed":        self._armed,
             "mode":         self._mode_name,
-            "manual_mode":  self._manual_mode,
-            "tf02_dist_m":  self._tf02.distance_m,
-            "vib_x":        self._vib_x,
-            "vib_y":        self._vib_y,
-            "vib_z":        self._vib_z,
-            "rc_ch8":       self._rc_ch8,
+            "tf02_dist_m":  alt_m,
         }
-        # ── VIO telemetry ─────────────────────────────────────────
         if self._vio is not None:
-            roll_c, pitch_c, vio_active = self._vio.get_corrections()
-            pos_x, pos_y = self._vio.get_position()
-            telem["vio_active"] = vio_active
-            telem["vio_source"] = self._vio.source
-            telem["vio_roll_corr"] = roll_c
-            telem["vio_pitch_corr"] = pitch_c
-            telem["vio_pos_x"] = round(pos_x, 3)
-            telem["vio_pos_y"] = round(pos_y, 3)
+            roll, pitch, active = self._vio.get_corrections()
+            telem["vio_active"] = active
+            telem["vio_roll_pwm"] = roll
+            telem["vio_pitch_pwm"] = pitch
         else:
             telem["vio_active"] = False
-            telem["vio_source"] = "none"
-            telem["vio_roll_corr"] = 0
-            telem["vio_pitch_corr"] = 0
-            telem["vio_pos_x"] = 0.0
-            telem["vio_pos_y"] = 0.0
+            telem["vio_roll_pwm"] = 1500
+            telem["vio_pitch_pwm"] = 1500
         return telem
 
     def run(self) -> None:
         """Execute the state machine main loop."""
         Logger.header("ASCEND STATE MACHINE — FLY MODE")
-        Logger.info(f"Target altitude : {Config.TARGET_ALT_M} m")
-        Logger.info(f"Hover duration  : {Config.HOVER_DURATION} s")
-        Logger.info("RC8 DOWN (<1300) = Autonomous | RC8 UP (>1700) = Manual RC")
+        Logger.info(f"Target altitude  : {Config.HOVER_TARGET_ALT_M} m")
+        Logger.info(f"Hover duration   : {Config.HOVER_DURATION_S} s")
+        Logger.info(f"Takeoff threshold: {Config.TAKEOFF_ALT_THRESHOLD} m")
         Logger.info("Press Ctrl+C to abort → emergency LAND\n")
 
         self._px.request_data_streams(rate_hz=10)
@@ -164,30 +152,26 @@ class StateMachine:
 
         try:
             while self._running:
-                # ── Ingest MAVLink messages ────────────────────────
                 self._poll_mavlink()
 
-                # ── RC8 switch check (highest priority) ───────────
-                self._check_rc8_switch()
+                # Safety monitor check (any state except DONE)
+                if self._state not in (State.DONE, State.LAND, State.DISARM):
+                    if self._safety.emergency_flag:
+                        Logger.error(
+                            f"Safety trigger: {self._safety.emergency_reason}"
+                        )
+                        self._transition(State.LAND)
 
-                if self._manual_mode:
-                    time.sleep(Config.TX_POLL_INTERVAL)
-                    continue
-
-                # ── Safety monitor check ──────────────────────────
-                if self._safety.emergency_flag and self._state != State.EMERGENCY:
-                    Logger.error(f"Safety trigger: {self._safety.emergency_reason}")
-                    self._transition(State.EMERGENCY)
-
-                # ── State handlers ────────────────────────────────
+                # State dispatch
                 handler = {
-                    State.IDLE:       self._state_idle,
-                    State.PREFLIGHT:  self._state_preflight,
-                    State.TAKEOFF:    self._state_takeoff,
-                    State.HOVER:      self._state_hover,
-                    State.RETURN:     self._state_return,
-                    State.LAND:       self._state_land,
-                    State.EMERGENCY:  self._state_emergency,
+                    State.IDLE:      self._state_idle,
+                    State.PREFLIGHT: self._state_preflight,
+                    State.ARM:       self._state_arm,
+                    State.TAKEOFF:   self._state_takeoff,
+                    State.HOVER:     self._state_hover,
+                    State.LAND:      self._state_land,
+                    State.DISARM:    self._state_disarm,
+                    State.DONE:      self._state_done,
                 }.get(self._state)
 
                 if handler:
@@ -200,7 +184,7 @@ class StateMachine:
             self._px.clear_rc_override()
             self._px.set_mode("LAND")
             time.sleep(0.5)
-            self._force_disarm()
+            self._px.disarm()
         finally:
             self._running = False
 
@@ -212,7 +196,7 @@ class StateMachine:
 
     def _poll_mavlink(self) -> None:
         """Read all pending MAVLink messages and cache relevant data."""
-        for _ in range(20):  # drain up to 20 messages per tick
+        for _ in range(20):
             msg = self._px.recv_any(timeout=0.005)
             if msg is None:
                 break
@@ -231,307 +215,333 @@ class StateMachine:
                 self._battery_volt = msg.voltage_battery / 1000.0
                 self._battery_pct = max(0, min(100, msg.battery_remaining))
 
-            elif mtype == "GLOBAL_POSITION_INT":
-                self._altitude_m = msg.relative_alt / 1000.0
-
             elif mtype == "LOCAL_POSITION_NED":
                 self._safety.update_position(msg.x, msg.y)
-
-            elif mtype == "VIBRATION":
-                self._vib_x = msg.vibration_x
-                self._vib_y = msg.vibration_y
-                self._vib_z = msg.vibration_z
-
-            elif mtype == "EXTENDED_SYS_STATE":
-                self._landed_state = msg.landed_state
 
             elif mtype == "STATUSTEXT":
                 Logger.warn(f"FC: {msg.text}")
 
-            elif mtype == "RC_CHANNELS":
-                self._rc_ch8 = msg.chan8_raw  # cache ch8 for switch logic
-
-    # ── RC8 Switch ─────────────────────────────────────────────────────
-
-    def _check_rc8_switch(self) -> None:
-        """Check RC channel 8 to toggle autonomous / manual mode."""
-        ch8 = self._rc_ch8
-        if ch8 == 0 or ch8 == 65535:
-            return
-
-        autonomous_requested = ch8 < 1300   # switch DOWN = autonomous
-        manual_requested = ch8 > 2000       # switch UP   = manual
-
-        if manual_requested and not self._manual_mode:
-            Logger.warn(f"RC8 MANUAL MODE (ch8={ch8}) → STABILIZE")
-            self._manual_mode = True
-            self._px.set_mode("STABILIZE")
-            self._px.clear_rc_override()
-
-        elif autonomous_requested and self._manual_mode:
-            Logger.ok(f"RC8 AUTONOMOUS MODE (ch8={ch8}) → resuming mission")
-            self._manual_mode = False
-            self._safety.reset()
-            self._transition(State.IDLE)
-
     # ── State Transition ───────────────────────────────────────────────
 
     def _transition(self, new_state: State) -> None:
+        """Perform a state transition with logging."""
         old = self._state
         self._state = new_state
-        self._emergency_land_sent = False
-        self._takeoff_sent = False
-        self._ramp_throttle = 1100
-        self._lifted = False
+        self._state_enter_time = time.time()
 
+        # Activate safety monitoring during flight phases
         if new_state in (State.TAKEOFF, State.HOVER):
             self._safety.set_flight_active(True)
-        elif new_state in (State.IDLE, State.LAND):
+        elif new_state in (State.IDLE, State.LAND, State.DISARM, State.DONE):
             self._safety.set_flight_active(False)
 
         Logger.ok(f"STATE: {old.value} → {new_state.value}")
 
+    # ── VIO Helper ─────────────────────────────────────────────────────
+
+    def _get_vio_roll_pitch(self) -> tuple:
+        """Return (roll_pwm, pitch_pwm) from VIO or neutral."""
+        if self._vio is not None:
+            roll, pitch, active = self._vio.get_corrections()
+            if active:
+                self._vio_active_ticks += 1
+            self._total_ticks += 1
+            return (
+                max(Config.RC_PWM_MIN, min(Config.RC_PWM_MAX, roll)),
+                max(Config.RC_PWM_MIN, min(Config.RC_PWM_MAX, pitch)),
+            )
+        self._total_ticks += 1
+        return (1500, 1500)
+
     # ── State Handlers ─────────────────────────────────────────────────
 
     def _state_idle(self) -> None:
-        """IDLE — waiting on the ground. Auto-transition to PREFLIGHT."""
+        """IDLE — verify threads alive, GPS-denied confirmed, auto-advance."""
+        Logger.info("IDLE: verifying system ready …")
+        # Quick sanity: TF02 thread alive
+        if self._tf02 is not None and self._tf02.is_alive():
+            Logger.ok("TF02Reader thread alive")
+        else:
+            Logger.warn("TF02Reader thread NOT alive — proceeding anyway")
         self._transition(State.PREFLIGHT)
 
     def _state_preflight(self) -> None:
-        """PREFLIGHT — arm the drone and validate sensors."""
-        Logger.info("Preflight: arming in STABILIZE mode …")
-        self._px.set_mode("STABILIZE")
+        """PREFLIGHT — run health checks.  On pass → ARM.  On fail → abort."""
+        Logger.info("PREFLIGHT: running health checks …")
 
-        deadline = time.time() + Config.PREFLIGHT_TIMEOUT
-        while time.time() < deadline and self._running:
-            self._poll_mavlink()
-            if self._mode_name == "STABILIZE":
-                Logger.ok("Mode confirmed STABILIZE — sending ARM")
-                break
-            time.sleep(0.2)
-        else:
-            Logger.error("Could not set STABILIZE mode — returning to IDLE")
-            self._transition(State.IDLE)
+        # Check 1: Pixhawk heartbeat present
+        self._poll_mavlink()
+        if not self._px.connected:
+            Logger.error("No Pixhawk heartbeat — cannot fly")
+            self._running = False
             return
 
-        time.sleep(0.5)
-        self._px.arm()
-
-        deadline = time.time() + Config.PREFLIGHT_TIMEOUT
-        while time.time() < deadline and self._running:
-            self._poll_mavlink()
-            if self._armed:
-                Logger.ok("Drone ARMED")
-                self._px.set_mode("STABILIZE")
-                self._transition(State.TAKEOFF)
+        # Check 2: TF-02 reading
+        tf02_m = self._tf02.distance_m
+        if tf02_m is None:
+            Logger.warn("TF-02 no reading yet — waiting 2s …")
+            time.sleep(2.0)
+            tf02_m = self._tf02.distance_m
+            if tf02_m is None:
+                Logger.error("TF-02 still no data — abort")
+                self._running = False
                 return
-            time.sleep(0.2)
+        Logger.ok(f"TF-02 reading: {tf02_m:.2f} m")
 
-        Logger.error("Arming FAILED within timeout — returning to IDLE")
-        self._transition(State.IDLE)
+        # Check 3: Battery voltage
+        if 0 < self._battery_volt < Config.BATT_CRITICAL_VOLT:
+            Logger.error(
+                f"Battery CRITICAL: {self._battery_volt:.2f}V — abort"
+            )
+            self._running = False
+            return
 
-    def _get_vio_roll_pitch(self) -> tuple:
-        """Return (roll_pwm, pitch_pwm) with VIO corrections applied.
+        Logger.ok("Preflight checks passed")
+        self._transition(State.ARM)
 
-        If VIO is unavailable or inactive, returns neutral (1500, 1500).
-        """
-        roll = 1500
-        pitch = 1500
-        if self._vio is not None:
-            roll_c, pitch_c, _ = self._vio.get_corrections()
-            roll = max(1000, min(2000, 1500 + roll_c))
-            pitch = max(1000, min(2000, 1500 + pitch_c))
-        return roll, pitch
+    def _state_arm(self) -> None:
+        """ARM — set STABILIZE mode, send arm command, wait for confirmation."""
+        elapsed = time.time() - self._state_enter_time
+
+        # On first entry: set mode and arm
+        if elapsed < 0.1:
+            Logger.info("ARM: setting STABILIZE mode and arming …")
+            self._px.set_mode("STABILIZE")
+            time.sleep(0.5)
+            self._px.arm()
+            return
+
+        # Wait for armed status
+        self._poll_mavlink()
+        if self._armed:
+            Logger.ok("Drone ARMED — STABILIZE mode confirmed")
+            self._flight_start = time.time()
+            self._transition(State.TAKEOFF)
+            return
+
+        # Timeout
+        if elapsed > Config.ARM_TIMEOUT_S:
+            Logger.error(
+                f"Arming FAILED within {Config.ARM_TIMEOUT_S:.0f}s — "
+                "transitioning to DISARM"
+            )
+            self._transition(State.DISARM)
 
     def _state_takeoff(self) -> None:
-        """TAKEOFF — gradual throttle ramp until liftoff then climb to target."""
-        tf02 = self._tf02.distance_m
-        if tf02 is None:
-            Logger.warn("TF02 no data — holding")
-            self._px.send_rc_override(throttle=1100)
+        """TAKEOFF — throttle ramp in STABILIZE + VIO roll/pitch corrections.
+
+        Ramp throttle from MIN to BASE, apply altitude P-controller during
+        climb.  Transition to HOVER when altitude >= TAKEOFF_ALT_THRESHOLD.
+        """
+        elapsed = time.time() - self._state_enter_time
+        alt_m = self._tf02.distance_m
+
+        if alt_m is None:
+            Logger.warn("TAKEOFF: TF02 no data — holding throttle")
+            roll, pitch = self._get_vio_roll_pitch()
+            self._px.send_rc_override(
+                roll=roll, pitch=pitch,
+                throttle=self._ramp_throttle
+            )
             return
 
-        alt = tf02
-        target = Config.TARGET_ALT_M
+        # Track altitude stats
+        self._min_alt = min(self._min_alt, alt_m)
+        self._max_alt = max(self._max_alt, alt_m)
 
-        if self._ground_alt == 0.0:
-            self._ground_alt = alt
-            Logger.info(f"Starting throttle ramp from 1100. Ground={alt:.2f}m")
+        # Timeout check
+        if elapsed > Config.TAKEOFF_TIMEOUT_S:
+            Logger.error(
+                f"TAKEOFF timeout ({Config.TAKEOFF_TIMEOUT_S:.0f}s) — LAND"
+            )
+            self._transition(State.LAND)
+            return
 
-        # Get VIO-corrected roll/pitch for X-Y stabilization
-        roll, pitch = self._get_vio_roll_pitch()
+        # Altitude reached → HOVER
+        if alt_m >= Config.TAKEOFF_ALT_THRESHOLD:
+            Logger.ok(f"Altitude {alt_m:.2f}m >= {Config.TAKEOFF_ALT_THRESHOLD}m → HOVER")
+            self._current_throttle = self._ramp_throttle
+            self._transition(State.HOVER)
+            return
 
-        if not self._lifted:
-            if alt > self._ground_alt + 0.15:
-                self._lifted = True
-                Logger.ok(f"LIFTOFF detected at throttle={self._ramp_throttle} alt={alt:.2f}m")
-            else:
-                self._ramp_throttle += 1
-                self._ramp_throttle = min(self._ramp_throttle, 2000)
-                Logger.info(f"Ramping... alt={alt:.2f}m throttle={self._ramp_throttle}")
-                self._px.send_rc_override(
-                    roll=roll, pitch=pitch, throttle=self._ramp_throttle
-                )
-                return
+        # Throttle ramp: climb towards target
+        error = Config.HOVER_TARGET_ALT_M - alt_m
+        target_throttle = int(Config.BASE_THROTTLE_PWM + Config.HOVER_KP_ALT * error)
 
-        error = target - alt
-        KP = 30.0
-        throttle = int(self._ramp_throttle + KP * error)
-        throttle = max(1100, min(1900, throttle))
-
-        Logger.info(f"CLIMBING alt={alt:.2f}m target={target:.2f}m error={error:.2f}m throttle={throttle}")
-        self._px.send_rc_override(roll=roll, pitch=pitch, throttle=throttle)
-
-        if abs(error) <= Config.ALT_TOLERANCE_M:
-            if self._alt_stable_since is None:
-                self._alt_stable_since = time.time()
-            elif time.time() - self._alt_stable_since >= Config.ALT_STABLE_TIME:
-                Logger.ok(f"Altitude stable at {alt:.2f}m")
-                self._alt_stable_since = None
-                self._hover_throttle = throttle
-                self._ramp_throttle = 1100
-                self._lifted = False
-                self._transition(State.HOVER)
+        # Ramp smoothly (don't jump instantly to target)
+        if self._ramp_throttle < target_throttle:
+            self._ramp_throttle = min(
+                self._ramp_throttle + 5,   # ~5 PWM per tick at 20Hz
+                target_throttle,
+                Config.MAX_THROTTLE_PWM
+            )
         else:
-            self._alt_stable_since = None
+            self._ramp_throttle = max(
+                target_throttle,
+                Config.MIN_THROTTLE_PWM
+            )
 
-    def _state_hover(self) -> None:
-        """HOVER — hold altitude (Z) + CV position hold (X-Y)."""
-        if self._hover_start is None:
-            self._hover_start = time.time()
-            # Reset VIO position origin — hold from HERE
-            if self._vio is not None:
-                self._vio.reset_position()
-            Logger.info(f"Hovering for {Config.HOVER_DURATION:.0f}s …")
-
-        tf02 = self._tf02.distance_m
-        if tf02 is None:
-            self._px.send_rc_override(throttle=1500)
-            return
-
-        alt = tf02
-        target = Config.TARGET_ALT_M
-        error = target - alt
-        base = getattr(self, '_hover_throttle', 1500)
-
-        KP = 30.0
-        throttle = int(base + KP * error)
-        throttle = max(1100, min(1900, throttle))
-
-        # Get VIO-corrected roll/pitch for X-Y stabilization
         roll, pitch = self._get_vio_roll_pitch()
-
-        elapsed = time.time() - self._hover_start
-        vio_tag = ""
-        if self._vio is not None and self._vio.active:
-            rc, pc, _ = self._vio.get_corrections()
-            px, py = self._vio.get_position()
-            src = self._vio.source
-            vio_tag = f" vio_r={rc:+d} vio_p={pc:+d} pos=({px:+.2f},{py:+.2f})m src={src}"
-        Logger.info(
-            f"HOVER alt={alt:.2f}m error={error:.2f}m throttle={throttle}"
-            f" roll={roll} pitch={pitch}{vio_tag} elapsed={elapsed:.0f}s"
+        self._px.send_rc_override(
+            roll=roll, pitch=pitch,
+            throttle=self._ramp_throttle
         )
 
+        Logger.info(
+            f"TAKEOFF alt={alt_m:.2f}m throttle={self._ramp_throttle} "
+            f"elapsed={elapsed:.1f}s"
+        )
+
+    def _state_hover(self) -> None:
+        """HOVER — altitude P-controller + VIO roll/pitch corrections.
+
+        Throttle = BASE_THROTTLE + Kp_alt × (target_alt - current_alt)
+        Duration: HOVER_DURATION_S seconds.
+        """
+        if self._hover_start is None:
+            self._hover_start = time.time()
+            if self._vio is not None:
+                self._vio.reset()
+            Logger.info(f"Hovering for {Config.HOVER_DURATION_S:.0f}s …")
+
+        alt_m = self._tf02.distance_m
+        if alt_m is None:
+            roll, pitch = self._get_vio_roll_pitch()
+            self._px.send_rc_override(roll=roll, pitch=pitch, throttle=1500)
+            return
+
+        # Track altitude stats
+        self._min_alt = min(self._min_alt, alt_m)
+        self._max_alt = max(self._max_alt, alt_m)
+
+        # Altitude P-controller
+        error = Config.HOVER_TARGET_ALT_M - alt_m
+        throttle = int(Config.BASE_THROTTLE_PWM + Config.HOVER_KP_ALT * error)
+        throttle = max(Config.MIN_THROTTLE_PWM, min(Config.MAX_THROTTLE_PWM, throttle))
+
+        # VIO corrections
+        roll, pitch = self._get_vio_roll_pitch()
+
+        # Apply RC override
         self._px.send_rc_override(
             roll=roll, pitch=pitch, throttle=throttle
         )
 
-        if 0 < self._battery_volt < Config.LOW_BATTERY_VOLT:
-            Logger.warn(f"Low battery ({self._battery_volt:.2f}V) → RETURN")
+        elapsed = time.time() - self._hover_start
+
+        # 1 Hz logging
+        if int(elapsed) != int(elapsed - Config.MAIN_LOOP_INTERVAL):
+            vio_tag = ""
+            if self._vio is not None and self._vio.is_active:
+                vio_r, vio_p, _ = self._vio.get_corrections()
+                vio_tag = f" vio_r={vio_r} vio_p={vio_p}"
+            Logger.info(
+                f"HOVER alt={alt_m:.2f}m err={error:+.2f}m "
+                f"thr={throttle}{vio_tag} t={elapsed:.0f}s"
+            )
+
+        # Battery check
+        if 0 < self._battery_volt < Config.BATT_LOW_VOLT:
+            Logger.warn(
+                f"Low battery ({self._battery_volt:.2f}V) → LAND"
+            )
             self._hover_start = None
-            self._transition(State.RETURN)
+            self._transition(State.LAND)
             return
 
-        if elapsed >= Config.HOVER_DURATION:
-            Logger.ok(f"Hover complete ({elapsed:.0f}s) → RETURN")
+        # Duration complete
+        if elapsed >= Config.HOVER_DURATION_S:
+            Logger.ok(f"Hover complete ({elapsed:.0f}s) → LAND")
             self._hover_start = None
-            self._transition(State.RETURN)
-
-    def _state_return(self) -> None:
-        """RETURN — descend slowly back to ground."""
-        self._transition(State.LAND)
+            self._transition(State.LAND)
 
     def _state_land(self) -> None:
-        """LAND — controlled descent, wait for touchdown."""
-        self._px.set_mode("LAND")
-        self._check_touchdown()
-        self._check_crash_disarm()
+        """LAND — linear throttle reduction over LAND_DURATION_S seconds.
 
-    def _state_emergency(self) -> None:
-        """EMERGENCY — immediate LAND from any state."""
-        if not self._emergency_land_sent:
-            self._px.set_mode("LAND")
+        When alt < 0.08m or throttle at minimum → DISARM.
+        """
+        if self._land_start is None:
+            self._land_start = time.time()
+            self._current_throttle = max(
+                self._ramp_throttle, Config.BASE_THROTTLE_PWM
+            )
             self._px.clear_rc_override()
-            self._emergency_land_sent = True
-        self._check_touchdown()
-        self._check_crash_disarm()
+            Logger.info(
+                f"LAND: reducing throttle from {self._current_throttle} "
+                f"over {Config.LAND_DURATION_S:.0f}s"
+            )
 
-    # ── Force Disarm (Crash Safety) ────────────────────────────────────
+        elapsed = time.time() - self._land_start
+        alt_m = self._tf02.distance_m
 
-    def _force_disarm(self) -> None:
-        """Force-disarm the drone — stops ALL motors immediately.
+        # Linear throttle reduction
+        fraction = min(elapsed / Config.LAND_DURATION_S, 1.0)
+        start_thr = Config.BASE_THROTTLE_PWM
+        throttle = int(start_thr - fraction * (start_thr - Config.MIN_THROTTLE_PWM))
+        throttle = max(Config.MIN_THROTTLE_PWM, throttle)
 
-        Uses the existing PixhawkLink.disarm() method. Called when:
-          - Ctrl+C abort
-          - Crash watchdog triggers (stuck on ground with props spinning)
-          - Cleanup / shutdown
-        """
-        Logger.warn("FORCE DISARM — stopping motors")
-        self._px.clear_rc_override()
-        self._px.disarm()
+        self._px.send_rc_override(throttle=throttle)
 
-    def _check_crash_disarm(self) -> None:
-        """Watchdog: if in LAND/EMERGENCY and stuck near ground, force-disarm.
+        # Check touchdown conditions
+        touchdown = False
+        if alt_m is not None and alt_m < 0.08:
+            Logger.ok(f"Near ground (alt={alt_m:.2f}m) — cutting motors")
+            touchdown = True
+        elif throttle <= Config.MIN_THROTTLE_PWM:
+            Logger.ok("Throttle at minimum — cutting motors")
+            touchdown = True
 
-        Prevents props from spinning after a crash/tip-over. If TF-02 reads
-        below CRASH_DISARM_ALT_M for longer than CRASH_DISARM_TIMEOUT, the
-        drone is force-disarmed regardless of FC landed_state.
-        """
-        if self._state not in (State.LAND, State.EMERGENCY):
-            self._crash_land_since = None
+        if touchdown:
+            self._px.clear_rc_override()
+            self._land_start = None
+            self._transition(State.DISARM)
+        else:
+            Logger.info(
+                f"LAND alt={alt_m:.2f}m thr={throttle} "
+                f"elapsed={elapsed:.1f}s"
+            ) if alt_m is not None else None
+
+    def _state_disarm(self) -> None:
+        """DISARM — send disarm command, wait for confirmation."""
+        elapsed = time.time() - self._state_enter_time
+
+        if elapsed < 0.1:
+            Logger.info("DISARM: sending disarm command …")
+            self._px.clear_rc_override()
+            self._px.disarm()
             return
 
-        tf02_m = self._tf02.distance_m
-        if tf02_m is not None and tf02_m < Config.CRASH_DISARM_ALT_M:
-            if self._crash_land_since is None:
-                self._crash_land_since = time.time()
-            elif time.time() - self._crash_land_since >= Config.CRASH_DISARM_TIMEOUT:
-                Logger.warn(
-                    f"Crash watchdog: alt={tf02_m:.2f}m for "
-                    f">{Config.CRASH_DISARM_TIMEOUT:.0f}s — force disarming"
-                )
-                self._force_disarm()
-                self._crash_land_since = None
-                self._safety.reset()
-                self._transition(State.IDLE)
-                self._running = False
-        else:
-            self._crash_land_since = None
+        self._poll_mavlink()
+        if not self._armed:
+            Logger.ok("Drone DISARMED")
+            self._transition(State.DONE)
+            return
 
-    # ── Touchdown Detection ────────────────────────────────────────────
+        if elapsed > Config.DISARM_TIMEOUT_S:
+            Logger.warn("Disarm timeout — forcing disarm")
+            self._px.disarm()
+            self._transition(State.DONE)
 
-    def _check_touchdown(self) -> None:
-        """Detect touchdown using three criteria."""
-        tf02_m = self._tf02.distance_m
-        tf02_low = tf02_m is not None and tf02_m < Config.TOUCHDOWN_ALT_M
-        on_ground = self._landed_state == 1
+    def _state_done(self) -> None:
+        """DONE — log mission summary, stop state machine."""
+        flight_time = time.time() - self._flight_start if self._flight_start else 0
+        vio_pct = (
+            (self._vio_active_ticks / self._total_ticks * 100)
+            if self._total_ticks > 0 else 0
+        )
 
-        if tf02_low:
-            if self._touchdown_since is None:
-                self._touchdown_since = time.time()
-        else:
-            self._touchdown_since = None
+        Logger.header("MISSION SUMMARY")
+        Logger.kv("Flight time", f"{flight_time:.1f} s")
+        Logger.kv("Min altitude", f"{self._min_alt:.2f} m"
+                   if self._min_alt != float("inf") else "N/A")
+        Logger.kv("Max altitude", f"{self._max_alt:.2f} m")
+        Logger.kv("VIO active", f"{vio_pct:.1f}%")
+        Logger.kv("Final battery", f"{self._battery_volt:.2f} V")
+        Logger.rule()
 
-        tf02_stable = (self._touchdown_since is not None and
-                       time.time() - self._touchdown_since >= Config.TOUCHDOWN_TIME)
+        self._running = False
 
-        if on_ground and tf02_stable and not self._armed:
-            Logger.ok("Touchdown confirmed — motors disarmed")
-            self._touchdown_since = None
-            self._safety.reset()
-            self._transition(State.IDLE)
-            self._running = False
+    # ── Utility ────────────────────────────────────────────────────────
 
     @staticmethod
     def _resolve_mode(mode_id: int) -> str:
@@ -543,20 +553,30 @@ class StateMachine:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Scheduler (Entry Point)
+# Scheduler (CLI Entry Point)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class Scheduler:
-    """CLI entry point — instantiates shared objects and routes to the correct mode."""
+    """CLI entry point — instantiates shared objects and routes to modes.
+
+    Modes:
+        check    — run pre-flight health checks
+        setup    — write Pixhawk parameters
+        autotune — passive AutoTune monitor
+        fly      — full autonomous flight (state machine)
+    """
+
     def __init__(self, mode: str) -> None:
         self._mode = mode.lower()
         self._threads: list = []
         self._tf02: Optional[TF02Reader] = None
         self._esp32_cam: Optional[ESP32CamReader] = None
-        self._cv_flow: Optional[CVFlowProcessor] = None
+        self._frame_reader: Optional[ESP32FrameReader] = None
+        self._orb_flow: Optional[ORBFlowProcessor] = None
         self._pixhawk: Optional[PixhawkLink] = None
 
     def run(self) -> int:
+        """Execute the selected mode.  Returns exit code."""
         Logger.banner()
         Logger.info(f"Mode: {self._mode}")
         Logger.rule()
@@ -583,6 +603,8 @@ class Scheduler:
             return 0
         finally:
             self._cleanup()
+
+    # ── Mode Runners ───────────────────────────────────────────────────
 
     def _run_check(self) -> int:
         if not self._connect_pixhawk():
@@ -617,37 +639,50 @@ class Scheduler:
         return 0
 
     def _run_fly(self) -> int:
+        """Start all threads and run the flight state machine."""
         if not self._connect_pixhawk():
             return 1
+
+        # Start hardware readers
         self._start_tf02()
         self._start_esp32_cam()
-        self._start_cv_flow()
-        time.sleep(5.0)
+        self._start_frame_reader()
 
+        # Let sensors stabilise
+        Logger.info("Waiting 3s for sensor stabilisation …")
+        time.sleep(3.0)
+
+        # Safety monitor
         safety = SafetyMonitor(self._tf02, self._pixhawk)
         safety.start()
         self._threads.append(safety)
 
-        # Start VIO stabilizer with fused CV + ESP32-CAM flow
+        # VIO stabilizer with dual pipelines
         vio = VIOStabilizer(
             esp32_cam=self._esp32_cam,
             tf02=self._tf02,
-            cv_flow=self._cv_flow,
+            cv_flow=self._orb_flow,
         )
         vio.start()
         self._threads.append(vio)
-        Logger.ok("VIO stabilizer started — fused CV + ESP32-CAM hover hold active")
+        Logger.ok("VIO stabilizer started — dual-pipeline fusion active")
 
+        # Bridge and heartbeat
         self._start_bridge()
         self._start_heartbeat()
 
+        # State machine
         sm = StateMachine(self._pixhawk, self._tf02, safety, vio=vio)
+
+        # Telemetry streamer
         telem = TelemetryStreamer(sm.get_telemetry)
         telem.start()
         self._threads.append(telem)
 
         sm.run()
         return 0
+
+    # ── Thread Starters ────────────────────────────────────────────────
 
     def _connect_pixhawk(self) -> bool:
         self._pixhawk = PixhawkLink()
@@ -669,25 +704,41 @@ class Scheduler:
         self._threads.append(hb)
 
     def _start_esp32_cam(self) -> None:
-        """Start the ESP32-CAM optical-flow reader thread."""
-        self._esp32_cam = ESP32CamReader()
-        self._esp32_cam.start()
-        self._threads.append(self._esp32_cam)
-
-    def _start_cv_flow(self) -> None:
-        """Start the RPi5 OpenCV optical-flow processor thread."""
+        """Start the ESP32-CAM optical-flow reader (UART0, ttyAMA2)."""
         try:
-            self._cv_flow = CVFlowProcessor(camera_id=Config.CV_CAMERA_ID)
-            self._cv_flow.start()
-            self._threads.append(self._cv_flow)
-            Logger.ok(f"CV flow processor started on camera {Config.CV_CAMERA_ID}")
+            self._esp32_cam = ESP32CamReader()
+            self._esp32_cam.start()
+            self._threads.append(self._esp32_cam)
+            Logger.ok("ESP32-CAM flow reader started (ttyAMA2)")
         except Exception as exc:
-            Logger.warn(f"CV flow processor failed to start: {exc} — using ESP32-CAM only")
-            self._cv_flow = None
+            Logger.warn(f"ESP32-CAM flow reader failed: {exc}")
+            self._esp32_cam = None
+
+    def _start_frame_reader(self) -> None:
+        """Start ESP32 frame reader + ORB flow processor (UART2, ttyAMA3)."""
+        try:
+            self._frame_reader = ESP32FrameReader()
+            self._frame_reader.start()
+            self._threads.append(self._frame_reader)
+            Logger.ok("ESP32 frame reader started (ttyAMA3)")
+
+            self._orb_flow = ORBFlowProcessor(self._frame_reader)
+            self._orb_flow.start()
+            self._threads.append(self._orb_flow)
+            Logger.ok("ORB flow processor started")
+        except Exception as exc:
+            Logger.warn(
+                f"ESP32 frame/ORB pipeline failed: {exc} — "
+                "VIO will run ESP32-only"
+            )
+            self._frame_reader = None
+            self._orb_flow = None
+
+    # ── Cleanup ────────────────────────────────────────────────────────
 
     def _cleanup(self) -> None:
+        """Stop all threads and close connections."""
         Logger.info("Cleaning up …")
-        # Force-disarm as safety net — ensure motors stop
         if self._pixhawk and self._pixhawk.connected:
             try:
                 self._pixhawk.clear_rc_override()
@@ -705,7 +756,7 @@ class Scheduler:
         Logger.ok("Shutdown complete")
 
     def _shutdown_handler(self, signum: int, frame: object) -> None:
-        # Best-effort disarm before raising KeyboardInterrupt
+        """Best-effort disarm before raising KeyboardInterrupt."""
         if self._pixhawk and self._pixhawk.connected:
             try:
                 self._pixhawk.clear_rc_override()
@@ -716,9 +767,10 @@ class Scheduler:
 
 
 def main() -> None:
+    """CLI entry point: python3 -m ascend --mode <mode>"""
     parser = argparse.ArgumentParser(
         prog="ascend",
-        description="ASCEND Phase 1 — Autonomous drone flight system",
+        description="ASCEND — Autonomous drone flight system (IRoC-U 2026)",
     )
     parser.add_argument(
         "--mode",

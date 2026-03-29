@@ -1,6 +1,7 @@
 """
-ASCEND Phase 1 — Configuration
+ASCEND — Configuration
 All system constants in one place. No magic numbers anywhere else.
+Hardware: Pixhawk 2.4.8 (ArduCopter), RPi4, TF-02 LiDAR, ESP32-CAM (OV2640).
 """
 
 
@@ -8,15 +9,15 @@ class Config:
     """Centralised configuration for the ASCEND drone system.
 
     Every tunable constant — serial ports, baud rates, timing values,
-    thresholds, Pixhawk parameters, geofence limits — lives here so
-    nothing is hard-coded elsewhere in the codebase.
+    thresholds, PID gains, Pixhawk parameters — lives here so nothing
+    is hard-coded elsewhere in the codebase.
     """
 
     # ── Serial Ports ───────────────────────────────────────────────────
     PIXHAWK_PORT: str = "/dev/ttyACM0"
-    PIXHAWK_BAUD: int = 921600
+    PIXHAWK_BAUD: int = 115200
 
-    TF02_PORT: str = "/dev/serial0"
+    TF02_PORT: str = "/dev/ttyAMA0"
     TF02_BAUD: int = 115200
 
     # ── TF-02 Frame Constants ──────────────────────────────────────────
@@ -25,85 +26,127 @@ class Config:
     TF02_MIN_CM: int = 30
     TF02_MAX_CM: int = 800
 
-    # ── ESP32-CAM (VIO Optical Flow) ──────────────────────────────────
+    # ── ESP32-CAM Flow Packets (UART0 → ttyAMA2 @ 115200) ─────────────
     ESP32_CAM_PORT: str = "/dev/ttyAMA2"
-    ESP32_CAM_BAUD: int = 921600
-    ESP32_CAM_HEADER_1: int = 0xAA
-    ESP32_CAM_HEADER_2: int = 0x55
+    ESP32_CAM_BAUD: int = 115200
+    ESP32_CAM_HEADER_1: int = 0xAB
+    ESP32_CAM_HEADER_2: int = 0xCD
     ESP32_CAM_FRAME_LEN: int = 8
 
-    # ── VIO Stabilization ─────────────────────────────────────────────
-    VIO_RATE_HZ: int = 20                    # stabilizer loop rate
-    VIO_INTERVAL: float = 1.0 / 20           # 50 ms
-    VIO_KP: float = 0.5                      # velocity P-gain (PWM per m/s drift)
-    VIO_KI: float = 0.15                     # velocity I-gain (eliminates steady drift)
-    VIO_KD: float = 0.3                      # velocity D-gain (damps oscillation)
-    VIO_EMA_ALPHA: float = 0.4               # EMA smoothing (0–1, lower=smoother)
-    VIO_INTEGRAL_MAX: float = 50.0           # anti-windup clamp for I-term (PWM)
-    VIO_DEADZONE_PX: int = 2                 # ignore flow below this
-    VIO_MIN_QUALITY: int = 5                 # minimum tracked features
-    VIO_MAX_CORRECTION_PWM: int = 100        # max ±100 PWM from neutral
-    VIO_FOCAL_LENGTH_PX: float = 60.0        # OV2640 @ 96×96 approx
-    VIO_DATA_TIMEOUT: float = 0.5            # stale ESP32-CAM threshold
-    VIO_MIN_ALT_M: float = 0.0              # VIO active from ground up
+    # ── ESP32-CAM Raw Frames (UART2 → ttyAMA3 @ 921600) ───────────────
+    ESP32_FRAME_PORT: str = "/dev/ttyAMA3"
+    ESP32_FRAME_BAUD: int = 921600
+    ESP32_FRAME_WIDTH: int = 160
+    ESP32_FRAME_HEIGHT: int = 120
+    ESP32_FRAME_SYNC_1: int = 0xAA
+    ESP32_FRAME_SYNC_2: int = 0x55
+    ESP32_FRAME_PIXEL_COUNT: int = 160 * 120  # 19200
 
-    # ── VIO Position Hold (CV outer loop) ─────────────────────────────
-    VIO_POS_KP: float = 0.8                  # position P-gain (m/s per metre drift)
-    VIO_POS_MAX_M: float = 3.0               # position clamp — max tracked drift (m)
-    VIO_POS_DECAY: float = 0.998             # slow position decay to handle OF drift
+    # ── VIO Stabilization (common) ────────────────────────────────────
+    VIO_RATE_HZ: int = 20
+    VIO_INTERVAL: float = 1.0 / 20
+    VIO_DEADZONE_PX: int = 2
+    VIO_MIN_QUALITY: int = 5
+    VIO_MAX_CORRECTION_PWM: int = 100
+    VIO_FOCAL_LENGTH_PX: float = 100.0   # OV2640 @ QQVGA 160×120
+    VIO_DATA_TIMEOUT: float = 0.5
+    VIO_MIN_ALT_M: float = 0.3
+    VIO_INTEGRAL_MAX: float = 50.0       # anti-windup clamp (PWM)
 
-    # ── OpenCV Optical Flow (RPi5 camera) ─────────────────────────────
-    CV_CAMERA_ID: int = 0                    # /dev/video0 (Pi Camera or USB)
-    CV_FRAME_WIDTH: int = 160                # capture resolution (small = fast)
+    # ── ESP32 Pipeline PID ────────────────────────────────────────────
+    ESP_VIO_KP: float = 0.4
+    ESP_VIO_KI: float = 0.05
+    ESP_VIO_KD: float = 0.02
+    ESP_VIO_WEIGHT: float = 0.4
+
+    # ── ORB Pipeline PID ──────────────────────────────────────────────
+    ORB_VIO_KP: float = 0.5
+    ORB_VIO_KI: float = 0.08
+    ORB_VIO_KD: float = 0.03
+    ORB_VIO_WEIGHT: float = 0.6
+
+    # ── Legacy single-source VIO (kept for cv_flow.py compat) ─────────
+    VIO_KP: float = 0.5
+    VIO_KI: float = 0.15
+    VIO_KD: float = 0.3
+    VIO_EMA_ALPHA: float = 0.4
+
+    # ── VIO Position Hold (kept for backward compat) ──────────────────
+    VIO_POS_KP: float = 0.8
+    VIO_POS_MAX_M: float = 3.0
+    VIO_POS_DECAY: float = 0.998
+
+    # ── OpenCV Optical Flow (RPi camera, kept for cv_flow.py) ─────────
+    CV_CAMERA_ID: int = 0
+    CV_FRAME_WIDTH: int = 160
     CV_FRAME_HEIGHT: int = 120
-    CV_FPS: int = 30                         # target capture FPS
-    CV_MAX_CORNERS: int = 80                 # Shi-Tomasi: max features to track
-    CV_QUALITY_LEVEL: float = 0.05           # Shi-Tomasi: quality threshold
-    CV_MIN_DISTANCE: int = 7                 # Shi-Tomasi: min pixel spacing
-    CV_BLOCK_SIZE: int = 7                   # Shi-Tomasi: detection window
-    CV_LK_WIN_SIZE: int = 15                 # Lucas-Kanade: search window
-    CV_LK_MAX_LEVEL: int = 3                 # Lucas-Kanade: pyramid levels
-    CV_FB_THRESHOLD: float = 1.0             # forward-backward error threshold (px)
-    CV_FLOW_WEIGHT: float = 0.7              # weight for CV flow (vs 0.3 for ESP32)
+    CV_FPS: int = 30
+    CV_MAX_CORNERS: int = 80
+    CV_QUALITY_LEVEL: float = 0.05
+    CV_MIN_DISTANCE: int = 7
+    CV_BLOCK_SIZE: int = 7
+    CV_LK_WIN_SIZE: int = 15
+    CV_LK_MAX_LEVEL: int = 3
+    CV_FB_THRESHOLD: float = 1.0
+    CV_FLOW_WEIGHT: float = 0.7
+
+    # ── ORB Feature Detector ──────────────────────────────────────────
+    ORB_N_FEATURES: int = 200
+    ORB_RANSAC_THRESH: float = 5.0
+    ORB_MIN_MATCHES: int = 8
 
     # ── Crash Safety ──────────────────────────────────────────────────
-    CRASH_DISARM_ALT_M: float = 0.15         # force-disarm if below this alt
-    CRASH_DISARM_TIMEOUT: float = 3.0        # and stuck for this long (seconds)
+    CRASH_DISARM_ALT_M: float = 0.15
+    CRASH_DISARM_TIMEOUT: float = 3.0
 
     # ── MAVLink System IDs ─────────────────────────────────────────────
-    SYSTEM_ID: int = 1           # Pixhawk system ID
-    COMPANION_SYSID: int = 255   # RPi5 companion computer
-    COMPANION_COMPID: int = 190  # MAV_COMP_ID_ONBOARD_COMPUTER4
+    SYSTEM_ID: int = 1
+    COMPANION_SYSID: int = 255
+    COMPANION_COMPID: int = 190
 
     # ── Timing (seconds) ──────────────────────────────────────────────
     HEARTBEAT_INTERVAL: float = 1.0
+    HEARTBEAT_HZ: int = 1
     TELEMETRY_INTERVAL: float = 1.0
-    BRIDGE_HZ: int = 20                    # rangefinder bridge rate
-    BRIDGE_INTERVAL: float = 1.0 / BRIDGE_HZ
-    TX_POLL_INTERVAL: float = 0.1          # RC override check (100 ms)
-    MAIN_LOOP_INTERVAL: float = 0.05       # 20 Hz state-machine tick
-    CONNECT_TIMEOUT: float = 30.0          # wait for Pixhawk heartbeat
-    PARAM_TIMEOUT: float = 5.0             # param read/write ACK timeout
-    PREFLIGHT_TIMEOUT: float = 30.0        # arming attempt window
+    BRIDGE_HZ: int = 20
+    BRIDGE_INTERVAL: float = 1.0 / 20
+    TX_POLL_INTERVAL: float = 0.1
+    MAIN_LOOP_INTERVAL: float = 0.05
+    CONNECT_TIMEOUT: float = 30.0
+    PARAM_TIMEOUT: float = 5.0
+    PREFLIGHT_TIMEOUT: float = 30.0
 
     # ── Flight Parameters ──────────────────────────────────────────────
-    TARGET_ALT_M: float = 1.0              # hover altitude (metres)
-    ALT_TOLERANCE_M: float = 0.2           # ±0.2 m considered "at altitude"
-    ALT_STABLE_TIME: float = 2.0           # stable for 2 s → transition
-    HOVER_DURATION: float = 60.0           # 1 minute
-    TOUCHDOWN_ALT_M: float = 0.10          # TF-02 reading below this = ground
-    TOUCHDOWN_TIME: float = 1.0            # must be below for 1 s
-    HOME_RADIUS_M: float = 1.5             # RTL → LAND radius
+    TARGET_ALT_M: float = 1.0
+    HOVER_TARGET_ALT_M: float = 1.0
+    ALT_TOLERANCE_M: float = 0.2
+    ALT_STABLE_TIME: float = 2.0
+    HOVER_DURATION: float = 300.0       # 5 minutes (Task 2)
+    HOVER_DURATION_S: float = 300.0
+    HOVER_KP_ALT: float = 200.0        # PWM per metre error
+    BASE_THROTTLE_PWM: int = 1550
+    MIN_THROTTLE_PWM: int = 1100
+    MAX_THROTTLE_PWM: int = 1800
+    TAKEOFF_TIMEOUT_S: float = 15.0
+    TAKEOFF_ALT_THRESHOLD: float = 0.90
+    LAND_DURATION_S: float = 5.0
+    ARM_TIMEOUT_S: float = 10.0
+    DISARM_TIMEOUT_S: float = 5.0
+    TOUCHDOWN_ALT_M: float = 0.10
+    TOUCHDOWN_TIME: float = 1.0
+    HOME_RADIUS_M: float = 1.5
 
     # ── Geofence ───────────────────────────────────────────────────────
     FENCE_X_M: float = 15.0
     FENCE_Y_M: float = 15.0
 
     # ── Safety Thresholds ──────────────────────────────────────────────
-    TF02_DATA_TIMEOUT: float = 2.0         # no reading → emergency
-    WIFI_HB_TIMEOUT: float = 3.0           # no laptop heartbeat → emergency
-    LOW_BATTERY_VOLT: float = 14.0         # 3.5 V / cell
-    CRITICAL_BATTERY_VOLT: float = 9.0     # updated threshold
+    TF02_DATA_TIMEOUT: float = 2.0
+    WIFI_HB_TIMEOUT: float = 3.0
+    LOW_BATTERY_VOLT: float = 14.0
+    CRITICAL_BATTERY_VOLT: float = 13.2
+    BATT_LOW_VOLT: float = 14.0
+    BATT_CRITICAL_VOLT: float = 13.2
 
     # ── Vibration Thresholds (m/s²) ────────────────────────────────────
     VIB_EXCELLENT: float = 15.0
@@ -114,10 +157,11 @@ class Config:
     RC_PWM_MIN: int = 1000
     RC_PWM_MAX: int = 2000
     RC_INVALID_VALS: tuple = (0, 65535)
-    RC8_OPTION: int = 8  # <--- ADD THIS LINE
+    RC8_OPTION: int = 8
 
     # ── Telemetry Streaming ────────────────────────────────────────────
-    LAPTOP_IP: str = "255.255.255.255"         # laptop hotspot gateway
+    TELEMETRY_HOST: str = "0.0.0.0"
+    LAPTOP_IP: str = "255.255.255.255"
     TELEMETRY_PORT: int = 14550
 
     # ── Health-Check Durations (seconds) ───────────────────────────────
@@ -163,8 +207,8 @@ class Config:
         "FS_GCS_TIMEOUT":  3,
         "FS_THR_ENABLE":   0,
         "BATT_FS_LOW_ACT": 1,
-        "BATT_LOW_VOLT":   10.4,
-        "BATT_CRT_VOLT":   10,
+        "BATT_LOW_VOLT":   14.0,
+        "BATT_CRT_VOLT":   13.2,
     }
 
     # ── Pixhawk Parameters — Flight ───────────────────────────────────
@@ -193,6 +237,6 @@ class Config:
         "LAND":         9,
         "DRIFT":        11,
         "SPORT":        13,
-        "GUIDED_NOGPS": 20,  # ← add this
+        "GUIDED_NOGPS": 20,
         "AUTOTUNE":     17,
     }

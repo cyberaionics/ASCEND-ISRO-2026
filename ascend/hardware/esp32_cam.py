@@ -1,17 +1,20 @@
 """
-ASCEND Phase 2 — ESP32-CAM Optical Flow Reader
+ASCEND — ESP32-CAM Optical Flow Reader
 Daemon thread that continuously parses 8-byte optical-flow packets
-from the ESP32-CAM over UART (/dev/ttyAMA2).
+from the ESP32-CAM over UART (ttyAMA2 @ 115200).
 
-The ESP32-CAM runs a Lucas-Kanade optical-flow algorithm on 96×96
-grayscale frames at 30 Hz and transmits compact 8-byte packets:
+The ESP32-CAM runs block-matching SAD on a 6×5 grid of 16×16 blocks,
+±8 pixel search window, on 160×120 grayscale frames at 30 Hz and
+transmits compact 8-byte packets:
 
-    Byte 0:    0xAA         — sync header byte 1
-    Byte 1:    0x55         — sync header byte 2
-    Byte 2-3:  dx (int16)   — X displacement in pixels (big-endian)
-    Byte 4-5:  dy (int16)   — Y displacement in pixels (big-endian)
-    Byte 6:    quality      — tracked feature count (0–255)
-    Byte 7:    checksum     — (sum of bytes 0–6) & 0xFF
+    Byte 0:    0xAB         — sync header byte 1
+    Byte 1:    0xCD         — sync header byte 2
+    Byte 2:    flow_x low   — int16 little-endian (actual_pixels × 100)
+    Byte 3:    flow_x high
+    Byte 4:    flow_y low   — int16 little-endian (actual_pixels × 100)
+    Byte 5:    flow_y high
+    Byte 6:    quality      — uint8, valid SAD blocks count (0–30)
+    Byte 7:    checksum     — XOR of bytes 2, 3, 4, 5, 6
 """
 
 import struct
@@ -28,13 +31,17 @@ from ..logger import Logger
 class ESP32CamReader(threading.Thread):
     """Continuous ESP32-CAM optical-flow reader running in a daemon thread.
 
-    Validates checksums, discards bad frames, and exposes the latest
+    Validates XOR checksums, discards bad frames, and exposes the latest
     optical-flow readings through thread-safe properties.
 
+    Flow values are stored as raw int16 from the packet (actual_pixels × 100).
+    Consumers must divide by 100.0 to get actual pixel displacement.
+
     Attributes:
-        flow_dx:     Latest X displacement in pixels (positive = rightward).
-        flow_dy:     Latest Y displacement in pixels (positive = forward).
-        quality:     Tracked feature count from the current frame (0–255).
+        flow_dx:     Latest X displacement (int16, ×100 of actual pixels).
+        flow_dy:     Latest Y displacement (int16, ×100 of actual pixels).
+        quality:     Number of valid SAD blocks from the current frame (0–30).
+        last_update: time.time() of the most recent valid packet.
         data_age:    Seconds since the last valid reading.
         error_count: Running count of discarded / invalid frames.
     """
@@ -54,31 +61,31 @@ class ESP32CamReader(threading.Thread):
 
     @property
     def flow_dx(self) -> int:
-        """Latest X-axis optical-flow displacement in pixels."""
+        """Latest X-axis flow (int16, actual_pixels × 100)."""
         with self._lock:
             return self._flow_dx
 
     @property
     def flow_dy(self) -> int:
-        """Latest Y-axis optical-flow displacement in pixels."""
+        """Latest Y-axis flow (int16, actual_pixels × 100)."""
         with self._lock:
             return self._flow_dy
 
     @property
     def quality(self) -> int:
-        """Tracked feature count from the latest frame (0–255)."""
+        """Valid SAD block count from the latest frame (0–30)."""
         with self._lock:
             return self._quality
 
     @property
-    def error_count(self) -> int:
-        """Total count of discarded / invalid frames."""
+    def last_update(self) -> float:
+        """``time.time()`` of the most recent valid packet."""
         with self._lock:
-            return self._error_count
+            return self._last_read_time
 
     @property
     def last_read_time(self) -> float:
-        """``time.time()`` of the most recent valid frame."""
+        """Alias for last_update (backward compat)."""
         with self._lock:
             return self._last_read_time
 
@@ -90,13 +97,19 @@ class ESP32CamReader(threading.Thread):
                 return float("inf")
             return time.time() - self._last_read_time
 
+    @property
+    def error_count(self) -> int:
+        """Total count of discarded / invalid frames."""
+        with self._lock:
+            return self._error_count
+
     # ── Public API ─────────────────────────────────────────────────────
 
     def get_flow(self) -> tuple:
         """Return ``(dx, dy, quality)`` atomically.
 
         Returns:
-            Tuple of (dx_pixels, dy_pixels, quality_score).
+            Tuple of (dx_raw, dy_raw, quality). dx/dy are ×100.
         """
         with self._lock:
             return (self._flow_dx, self._flow_dy, self._quality)
@@ -109,7 +122,9 @@ class ESP32CamReader(threading.Thread):
 
     @staticmethod
     def _validate_frame(frame: bytes) -> bool:
-        """Return ``True`` if the 8-byte frame has valid headers and checksum.
+        """Return ``True`` if the 8-byte frame has valid headers and XOR checksum.
+
+        Checksum = XOR of bytes 2, 3, 4, 5, 6. Must equal byte 7.
 
         Args:
             frame: Exactly 8 bytes starting with the header pair.
@@ -121,19 +136,21 @@ class ESP32CamReader(threading.Thread):
             return False
         if frame[0] != Config.ESP32_CAM_HEADER_1 or frame[1] != Config.ESP32_CAM_HEADER_2:
             return False
-        checksum = sum(frame[:7]) & 0xFF
+        checksum = frame[2] ^ frame[3] ^ frame[4] ^ frame[5] ^ frame[6]
         return checksum == frame[7]
 
     def _parse_frame(self, frame: bytes) -> None:
         """Extract dx, dy, and quality from a validated frame.
 
+        Bytes 2-3: dx as signed int16 little-endian (actual_pixels × 100)
+        Bytes 4-5: dy as signed int16 little-endian (actual_pixels × 100)
+        Byte 6:    quality (uint8, 0–30)
+
         Args:
             frame: Validated 8-byte optical-flow packet.
         """
-        # Bytes 2-3: dx as signed int16 big-endian
-        # Bytes 4-5: dy as signed int16 big-endian
-        dx = struct.unpack(">h", frame[2:4])[0]
-        dy = struct.unpack(">h", frame[4:6])[0]
+        dx = struct.unpack("<h", frame[2:4])[0]
+        dy = struct.unpack("<h", frame[4:6])[0]
         quality = frame[6]
 
         with self._lock:
@@ -164,7 +181,7 @@ class ESP32CamReader(threading.Thread):
 
         try:
             while self._running.is_set():
-                # Synchronise to 0xAA 0x55 header pair
+                # Synchronise to 0xAB 0xCD header pair
                 byte = ser.read(1)
                 if not byte or byte[0] != Config.ESP32_CAM_HEADER_1:
                     continue
@@ -172,7 +189,7 @@ class ESP32CamReader(threading.Thread):
                 if not byte2 or byte2[0] != Config.ESP32_CAM_HEADER_2:
                     continue
 
-                # Read remaining 6 bytes (dx_hi, dx_lo, dy_hi, dy_lo, quality, checksum)
+                # Read remaining 6 bytes (dx_lo, dx_hi, dy_lo, dy_hi, quality, checksum)
                 rest = ser.read(6)
                 if len(rest) != 6:
                     with self._lock:

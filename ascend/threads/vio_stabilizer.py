@@ -1,19 +1,19 @@
 """
-ASCEND Phase 2 — VIO Hover Stabilizer (CV Fusion + Cascaded PID)
-Daemon thread that fuses two optical-flow sources for X-Y hover hold:
+ASCEND — VIO Hover Stabilizer (Dual-Pipeline PID Fusion)
+Daemon thread that fuses two independent optical-flow pipelines for
+X-Y hover hold in STABILIZE mode:
 
-  1. ESP32-CAM  — 30 Hz UART flow (fast, low quality, 96×96 simplified LK)
-  2. RPi5 CV    — 30 Hz OpenCV flow (slower, HIGH quality, Shi-Tomasi + LK)
+  Pipeline 1 — ESP32-CAM:  block-matching flow → physics → PID → weight 0.4
+  Pipeline 2 — ORB (RPi):  ORB keypoints + homography → physics → PID → weight 0.6
 
-Sensor Fusion Strategy:
-  • When BOTH sources have fresh data → weighted average
-    (CV_FLOW_WEIGHT for CV, 1-CV_FLOW_WEIGHT for ESP32)
-  • When only ONE source has data → use that source at full weight
-  • When NEITHER has data → zero output (graceful degradation)
+Fusion strategy:
+  • Both active → renormalized weighted sum of corrections
+  • Only one active → that pipeline at full weight (graceful degradation)
+  • Neither active → zero output, I-terms reset
+  • I-term reset on gate failure per-pipeline independently
 
-Architecture: Cascaded Position → Velocity Controller
-  Outer loop: Integrates fused velocity → position estimate → P-controller
-  Inner loop: PID on velocity error → roll/pitch PWM correction
+Output: .roll_pwm and .pitch_pwm (1500 ± correction) for direct use
+in PixhawkLink.send_rc_override().
 """
 
 import threading
@@ -27,20 +27,23 @@ from ..hardware.tf02 import TF02Reader
 
 
 class VIOStabilizer(threading.Thread):
-    """Fused CV + ESP32-CAM optical-flow → cascaded position+velocity hold.
+    """Dual-pipeline VIO optical-flow → PID → fused roll/pitch correction.
 
-    Accepts two optional flow sources. Uses whichever has fresh data,
-    preferring the CV source (higher quality) via weighted fusion.
+    Each pipeline runs an independent PID controller on velocity error.
+    The two corrections are fused at the output level using configurable
+    weights.  When a pipeline's safety gates fail, its I-term is reset
+    and it drops out of the fusion.
 
     Args:
-        esp32_cam: Running ESP32CamReader instance (UART flow, optional).
-        tf02:      Running TF02Reader instance (altitude scaling).
-        cv_flow:   Running CVFlowProcessor instance (OpenCV flow, optional).
+        esp32_cam: Running ESP32CamReader instance (UART flow, required).
+        tf02:      Running TF02Reader instance (altitude scaling, required).
+        cv_flow:   Running flow processor with same interface as ESP32CamReader
+                   (ORBFlowProcessor or CVFlowProcessor, optional).
     """
 
     def __init__(self, esp32_cam: Optional[ESP32CamReader],
                  tf02: TF02Reader,
-                 cv_flow=None) -> None:
+                 cv_flow: object = None) -> None:
         super().__init__(daemon=True, name="VIOStabilizer")
         self._cam = esp32_cam
         self._cv = cv_flow
@@ -49,279 +52,332 @@ class VIOStabilizer(threading.Thread):
         self._running = threading.Event()
         self._running.set()
 
-        # Output corrections (PWM offset from 1500)
-        self._roll_correction: int = 0
-        self._pitch_correction: int = 0
+        # Output (PWM values ready for RC override)
+        self._roll_pwm: int = 1500
+        self._pitch_pwm: int = 1500
+        self._is_active: bool = False
 
-        # ── CV Position Estimate (outer loop) ─────────────────────────
-        self._pos_x: float = 0.0   # metres right of hover origin
-        self._pos_y: float = 0.0   # metres forward of hover origin
+        # ── ESP32 pipeline PID state ──────────────────────────────────
+        self._esp_prev_time: float = 0.0
+        self._esp_integral_x: float = 0.0
+        self._esp_integral_y: float = 0.0
+        self._esp_prev_vx: float = 0.0
+        self._esp_prev_vy: float = 0.0
 
-        # ── Velocity state (inner loop) ───────────────────────────────
-        self._prev_time: float = 0.0
-        self._ema_vel_x: float = 0.0
-        self._ema_vel_y: float = 0.0
-
-        # PID state
-        self._integral_x: float = 0.0
-        self._integral_y: float = 0.0
-        self._prev_vel_err_x: float = 0.0
-        self._prev_vel_err_y: float = 0.0
-
-        # Diagnostics
-        self._active: bool = False
-        self._source: str = "none"  # "cv", "esp32", "fused", "none"
+        # ── ORB pipeline PID state ────────────────────────────────────
+        self._orb_prev_time: float = 0.0
+        self._orb_integral_x: float = 0.0
+        self._orb_integral_y: float = 0.0
+        self._orb_prev_vx: float = 0.0
+        self._orb_prev_vy: float = 0.0
 
     # ── Thread-safe Properties ─────────────────────────────────────────
 
     @property
-    def roll_correction(self) -> int:
+    def roll_pwm(self) -> int:
+        """Roll PWM value (1500 ± correction) for RC override."""
         with self._lock:
-            return self._roll_correction
+            return self._roll_pwm
 
     @property
-    def pitch_correction(self) -> int:
+    def pitch_pwm(self) -> int:
+        """Pitch PWM value (1500 ± correction) for RC override."""
         with self._lock:
-            return self._pitch_correction
+            return self._pitch_pwm
+
+    @property
+    def is_active(self) -> bool:
+        """True if at least one pipeline is producing corrections."""
+        with self._lock:
+            return self._is_active
 
     @property
     def active(self) -> bool:
+        """Alias for is_active (backward compat)."""
         with self._lock:
-            return self._active
-
-    @property
-    def source(self) -> str:
-        """Which flow source is currently active: 'cv', 'esp32', 'fused', 'none'."""
-        with self._lock:
-            return self._source
+            return self._is_active
 
     def get_corrections(self) -> tuple:
-        """Return ``(roll_correction, pitch_correction, active)`` atomically."""
+        """Return ``(roll_pwm, pitch_pwm, is_active)`` atomically."""
         with self._lock:
-            return (self._roll_correction, self._pitch_correction, self._active)
-
-    def get_position(self) -> tuple:
-        """Return ``(pos_x, pos_y)`` in metres from hover origin."""
-        with self._lock:
-            return (self._pos_x, self._pos_y)
+            return (self._roll_pwm, self._pitch_pwm, self._is_active)
 
     # ── Public API ─────────────────────────────────────────────────────
 
     def stop(self) -> None:
+        """Signal the stabilizer thread to stop."""
         self._running.clear()
 
-    def reset_position(self) -> None:
-        """Reset to current location as hover origin."""
-        with self._lock:
-            self._pos_x = 0.0
-            self._pos_y = 0.0
-            self._integral_x = 0.0
-            self._integral_y = 0.0
-            self._prev_vel_err_x = 0.0
-            self._prev_vel_err_y = 0.0
-            self._ema_vel_x = 0.0
-            self._ema_vel_y = 0.0
-        Logger.info("VIO: position origin reset to (0, 0)")
+    def reset(self) -> None:
+        """Reset both pipeline I-terms and velocity state."""
+        self._esp_integral_x = 0.0
+        self._esp_integral_y = 0.0
+        self._esp_prev_vx = 0.0
+        self._esp_prev_vy = 0.0
+        self._orb_integral_x = 0.0
+        self._orb_integral_y = 0.0
+        self._orb_prev_vx = 0.0
+        self._orb_prev_vy = 0.0
+        Logger.info("VIO: PID state reset")
 
-    # ── Sensor Fusion ──────────────────────────────────────────────────
+    # ── Per-Pipeline PID ───────────────────────────────────────────────
 
-    def _get_fused_flow(self) -> tuple:
-        """Read and fuse flow from available sources.
+    def _run_pipeline_esp(self, alt_m: float, now: float) -> Optional[tuple]:
+        """Run the ESP32-CAM pipeline.  Returns (roll_corr, pitch_corr) or None.
 
-        Returns:
-            (dx, dy, quality, source_name) or None if no valid data.
+        Flow values from ESP32CamReader are int16 × 100.
         """
-        cv_valid = False
-        esp_valid = False
-        cv_dx, cv_dy, cv_q = 0.0, 0.0, 0
-        esp_dx, esp_dy, esp_q = 0, 0, 0
-        timeout = Config.VIO_DATA_TIMEOUT
+        if self._cam is None:
+            return None
 
-        # ── Check CV flow (RPi5 OpenCV) ───────────────────────────────
-        if self._cv is not None:
-            if self._cv.data_age < timeout:
-                cv_dx, cv_dy, cv_q = self._cv.get_flow()
-                if cv_q >= Config.VIO_MIN_QUALITY:
-                    cv_valid = True
+        # Gate: data freshness
+        if self._cam.data_age > Config.VIO_DATA_TIMEOUT:
+            self._esp_reset_iterm()
+            return None
 
-        # ── Check ESP32-CAM flow (UART) ───────────────────────────────
-        if self._cam is not None:
-            if self._cam.data_age < timeout:
-                esp_dx, esp_dy, esp_q = self._cam.get_flow()
-                if esp_q >= Config.VIO_MIN_QUALITY:
-                    esp_valid = True
+        dx, dy, quality = self._cam.get_flow()
 
-        # ── Fuse ──────────────────────────────────────────────────────
-        if cv_valid and esp_valid:
-            # Weighted average — CV gets higher weight (more accurate)
-            w_cv = Config.CV_FLOW_WEIGHT
-            w_esp = 1.0 - w_cv
-            dx = w_cv * cv_dx + w_esp * esp_dx
-            dy = w_cv * cv_dy + w_esp * esp_dy
-            q = max(cv_q, esp_q)
-            return (dx, dy, q, "fused")
+        # Gate: quality
+        if quality < Config.VIO_MIN_QUALITY:
+            self._esp_reset_iterm()
+            return None
 
-        elif cv_valid:
-            return (cv_dx, cv_dy, cv_q, "cv")
+        # Time delta
+        if self._esp_prev_time == 0.0:
+            self._esp_prev_time = now
+            return None
 
-        elif esp_valid:
-            return (float(esp_dx), float(esp_dy), esp_q, "esp32")
+        dt = now - self._esp_prev_time
+        if dt <= 0.001 or dt > 0.5:
+            self._esp_prev_time = now
+            self._esp_reset_iterm()
+            return None
+        self._esp_prev_time = now
 
-        return None  # No valid source
+        # Deadzone
+        fdx = dx / 100.0 if abs(dx) >= Config.VIO_DEADZONE_PX * 100 else 0.0
+        fdy = dy / 100.0 if abs(dy) >= Config.VIO_DEADZONE_PX * 100 else 0.0
 
-    # ── Core Algorithm ─────────────────────────────────────────────────
+        # Flow → velocity (m/s)
+        vx = (fdx * alt_m) / (Config.VIO_FOCAL_LENGTH_PX * dt)
+        vy = (fdy * alt_m) / (Config.VIO_FOCAL_LENGTH_PX * dt)
+
+        # PID on velocity error (target = 0)
+        return self._pid_compute(
+            vx, vy, dt,
+            Config.ESP_VIO_KP, Config.ESP_VIO_KI, Config.ESP_VIO_KD,
+            "esp"
+        )
+
+    def _run_pipeline_orb(self, alt_m: float, now: float) -> Optional[tuple]:
+        """Run the ORB pipeline.  Returns (roll_corr, pitch_corr) or None.
+
+        Flow values from ORBFlowProcessor / CVFlowProcessor are actual pixels.
+        """
+        if self._cv is None:
+            return None
+
+        # Gate: data freshness
+        if self._cv.data_age > Config.VIO_DATA_TIMEOUT:
+            self._orb_reset_iterm()
+            return None
+
+        dx, dy, quality = self._cv.get_flow()
+
+        # Gate: quality
+        if quality < Config.VIO_MIN_QUALITY:
+            self._orb_reset_iterm()
+            return None
+
+        # Time delta
+        if self._orb_prev_time == 0.0:
+            self._orb_prev_time = now
+            return None
+
+        dt = now - self._orb_prev_time
+        if dt <= 0.001 or dt > 0.5:
+            self._orb_prev_time = now
+            self._orb_reset_iterm()
+            return None
+        self._orb_prev_time = now
+
+        # Deadzone
+        fdx = float(dx) if abs(dx) >= Config.VIO_DEADZONE_PX else 0.0
+        fdy = float(dy) if abs(dy) >= Config.VIO_DEADZONE_PX else 0.0
+
+        # Flow → velocity (m/s)
+        vx = (fdx * alt_m) / (Config.VIO_FOCAL_LENGTH_PX * dt)
+        vy = (fdy * alt_m) / (Config.VIO_FOCAL_LENGTH_PX * dt)
+
+        # PID on velocity error (target = 0)
+        return self._pid_compute(
+            vx, vy, dt,
+            Config.ORB_VIO_KP, Config.ORB_VIO_KI, Config.ORB_VIO_KD,
+            "orb"
+        )
+
+    def _pid_compute(self, vx: float, vy: float, dt: float,
+                     kp: float, ki: float, kd: float,
+                     pipeline: str) -> tuple:
+        """Generic PID computation on velocity.  Returns (roll_corr, pitch_corr).
+
+        Args:
+            vx, vy: Measured velocity in m/s.
+            dt: Time step in seconds.
+            kp, ki, kd: PID gains for this pipeline.
+            pipeline: "esp" or "orb" — selects which state variables to use.
+        """
+        # Proportional (negative: rightward flow → left roll to correct)
+        p_x = -kp * vx
+        p_y = -kp * vy
+
+        # Integral with anti-windup
+        int_max = Config.VIO_INTEGRAL_MAX / max(ki, 0.001)
+
+        if pipeline == "esp":
+            self._esp_integral_x += (-vx) * dt
+            self._esp_integral_y += (-vy) * dt
+            self._esp_integral_x = max(-int_max, min(int_max, self._esp_integral_x))
+            self._esp_integral_y = max(-int_max, min(int_max, self._esp_integral_y))
+            i_x = ki * self._esp_integral_x
+            i_y = ki * self._esp_integral_y
+            # Derivative (on velocity change, not error)
+            d_x = -kd * (vx - self._esp_prev_vx) / dt
+            d_y = -kd * (vy - self._esp_prev_vy) / dt
+            self._esp_prev_vx = vx
+            self._esp_prev_vy = vy
+        else:
+            self._orb_integral_x += (-vx) * dt
+            self._orb_integral_y += (-vy) * dt
+            self._orb_integral_x = max(-int_max, min(int_max, self._orb_integral_x))
+            self._orb_integral_y = max(-int_max, min(int_max, self._orb_integral_y))
+            i_x = ki * self._orb_integral_x
+            i_y = ki * self._orb_integral_y
+            d_x = -kd * (vx - self._orb_prev_vx) / dt
+            d_y = -kd * (vy - self._orb_prev_vy) / dt
+            self._orb_prev_vx = vx
+            self._orb_prev_vy = vy
+
+        roll_corr = p_x + i_x + d_x
+        pitch_corr = p_y + i_y + d_y
+
+        return (roll_corr, pitch_corr)
+
+    # ── I-term Reset ───────────────────────────────────────────────────
+
+    def _esp_reset_iterm(self) -> None:
+        """Reset ESP32 pipeline integrator and derivative state."""
+        self._esp_integral_x = 0.0
+        self._esp_integral_y = 0.0
+        self._esp_prev_vx = 0.0
+        self._esp_prev_vy = 0.0
+
+    def _orb_reset_iterm(self) -> None:
+        """Reset ORB pipeline integrator and derivative state."""
+        self._orb_integral_x = 0.0
+        self._orb_integral_y = 0.0
+        self._orb_prev_vx = 0.0
+        self._orb_prev_vy = 0.0
+
+    # ── Fusion ─────────────────────────────────────────────────────────
+
+    def _fuse_and_store(self, esp_result: Optional[tuple],
+                        orb_result: Optional[tuple]) -> None:
+        """Fuse pipeline outputs and store as thread-safe PWM values.
+
+        Renormalized weighted sum when both active; full weight when
+        only one active; zero when neither active.
+        """
+        esp_ok = esp_result is not None
+        orb_ok = orb_result is not None
+
+        if esp_ok and orb_ok:
+            w_esp = Config.ESP_VIO_WEIGHT
+            w_orb = Config.ORB_VIO_WEIGHT
+            total = w_esp + w_orb  # should be 1.0, renormalize anyway
+            roll_corr = (w_esp * esp_result[0] + w_orb * orb_result[0]) / total
+            pitch_corr = (w_esp * esp_result[1] + w_orb * orb_result[1]) / total
+
+        elif esp_ok:
+            roll_corr = esp_result[0]
+            pitch_corr = esp_result[1]
+
+        elif orb_ok:
+            roll_corr = orb_result[0]
+            pitch_corr = orb_result[1]
+
+        else:
+            # Neither pipeline active
+            with self._lock:
+                self._roll_pwm = 1500
+                self._pitch_pwm = 1500
+                self._is_active = False
+            return
+
+        # Clamp corrections
+        max_corr = Config.VIO_MAX_CORRECTION_PWM
+        roll_corr = max(-max_corr, min(max_corr, roll_corr))
+        pitch_corr = max(-max_corr, min(max_corr, pitch_corr))
+
+        with self._lock:
+            self._roll_pwm = 1500 + int(roll_corr)
+            self._pitch_pwm = 1500 + int(pitch_corr)
+            self._is_active = True
+
+    # ── Main Loop ──────────────────────────────────────────────────────
 
     def _compute_corrections(self) -> None:
-        """One iteration of the fused cascaded controller."""
+        """One iteration: run both pipelines, fuse, store."""
         now = time.time()
 
-        # ── Get fused flow ────────────────────────────────────────────
-        fused = self._get_fused_flow()
-        if fused is None:
-            self._zero_output()
-            return
-
-        flow_dx, flow_dy, quality, src = fused
-
-        # ── Altitude check ────────────────────────────────────────────
+        # Altitude gate (common to both pipelines)
         alt_m = self._tf02.distance_m
         if alt_m is None or alt_m < Config.VIO_MIN_ALT_M:
-            self._zero_output()
-            return
-
-        # ── Time delta ────────────────────────────────────────────────
-        if self._prev_time == 0.0:
-            self._prev_time = now
+            self._esp_reset_iterm()
+            self._orb_reset_iterm()
             with self._lock:
-                self._source = src
-            self._zero_output()
+                self._roll_pwm = 1500
+                self._pitch_pwm = 1500
+                self._is_active = False
             return
 
-        dt = now - self._prev_time
-        if dt <= 0.001 or dt > 0.5:
-            self._prev_time = now
-            self._reset_state()
-            self._zero_output()
-            return
+        # Run each pipeline independently
+        esp_result = self._run_pipeline_esp(alt_m, now)
+        orb_result = self._run_pipeline_orb(alt_m, now)
 
-        # ══════════════════════════════════════════════════════════════
-        # STEP 1: Flow → Velocity (with deadzone + EMA)
-        # ══════════════════════════════════════════════════════════════
-        fx = flow_dx if abs(flow_dx) >= Config.VIO_DEADZONE_PX else 0.0
-        fy = flow_dy if abs(flow_dy) >= Config.VIO_DEADZONE_PX else 0.0
-
-        scale = alt_m / (Config.VIO_FOCAL_LENGTH_PX * dt)
-        raw_vel_x = fx * scale
-        raw_vel_y = fy * scale
-
-        alpha = Config.VIO_EMA_ALPHA
-        self._ema_vel_x = alpha * raw_vel_x + (1.0 - alpha) * self._ema_vel_x
-        self._ema_vel_y = alpha * raw_vel_y + (1.0 - alpha) * self._ema_vel_y
-        vel_x = self._ema_vel_x
-        vel_y = self._ema_vel_y
-
-        # ══════════════════════════════════════════════════════════════
-        # STEP 2: Integrate velocity → position (CV position hold)
-        # ══════════════════════════════════════════════════════════════
-        self._pos_x += vel_x * dt
-        self._pos_y += vel_y * dt
-
-        self._pos_x *= Config.VIO_POS_DECAY
-        self._pos_y *= Config.VIO_POS_DECAY
-
-        pos_max = Config.VIO_POS_MAX_M
-        self._pos_x = max(-pos_max, min(pos_max, self._pos_x))
-        self._pos_y = max(-pos_max, min(pos_max, self._pos_y))
-
-        # ══════════════════════════════════════════════════════════════
-        # STEP 3: Outer P-loop — position → desired velocity
-        # ══════════════════════════════════════════════════════════════
-        desired_vel_x = -Config.VIO_POS_KP * self._pos_x
-        desired_vel_y = -Config.VIO_POS_KP * self._pos_y
-
-        # ══════════════════════════════════════════════════════════════
-        # STEP 4: Inner PID — velocity error → PWM correction
-        # ══════════════════════════════════════════════════════════════
-        vel_err_x = vel_x - desired_vel_x
-        vel_err_y = vel_y - desired_vel_y
-
-        # P
-        p_x = Config.VIO_KP * vel_err_x
-        p_y = Config.VIO_KP * vel_err_y
-
-        # I with anti-windup
-        self._integral_x += vel_err_x * dt
-        self._integral_y += vel_err_y * dt
-        int_max = Config.VIO_INTEGRAL_MAX / max(Config.VIO_KI, 0.001)
-        self._integral_x = max(-int_max, min(int_max, self._integral_x))
-        self._integral_y = max(-int_max, min(int_max, self._integral_y))
-        i_x = Config.VIO_KI * self._integral_x
-        i_y = Config.VIO_KI * self._integral_y
-
-        # D
-        d_err_x = (vel_err_x - self._prev_vel_err_x) / dt
-        d_err_y = (vel_err_y - self._prev_vel_err_y) / dt
-        d_x = Config.VIO_KD * d_err_x
-        d_y = Config.VIO_KD * d_err_y
-
-        # ══════════════════════════════════════════════════════════════
-        # STEP 5: Combine + clamp
-        # ══════════════════════════════════════════════════════════════
-        raw_roll = -(p_x + i_x + d_x)
-        raw_pitch = -(p_y + i_y + d_y)
-
-        max_corr = Config.VIO_MAX_CORRECTION_PWM
-        roll_corr = int(max(-max_corr, min(max_corr, raw_roll)))
-        pitch_corr = int(max(-max_corr, min(max_corr, raw_pitch)))
-
-        with self._lock:
-            self._roll_correction = roll_corr
-            self._pitch_correction = pitch_corr
-            self._active = True
-            self._source = src
-
-        self._prev_vel_err_x = vel_err_x
-        self._prev_vel_err_y = vel_err_y
-        self._prev_time = now
-
-    def _reset_state(self) -> None:
-        """Reset velocity/PID state (not position)."""
-        self._integral_x = 0.0
-        self._integral_y = 0.0
-        self._prev_vel_err_x = 0.0
-        self._prev_vel_err_y = 0.0
-        self._ema_vel_x = 0.0
-        self._ema_vel_y = 0.0
-
-    def _zero_output(self) -> None:
-        with self._lock:
-            self._roll_correction = 0
-            self._pitch_correction = 0
-            self._active = False
-            self._source = "none"
+        # Fuse and store
+        self._fuse_and_store(esp_result, orb_result)
 
     # ── Thread Entry ───────────────────────────────────────────────────
 
     def run(self) -> None:
+        """Run the VIO stabilizer loop at VIO_RATE_HZ."""
         sources = []
         if self._cam is not None:
             sources.append("ESP32-CAM")
         if self._cv is not None:
-            sources.append("RPi5-CV")
+            sources.append("ORB-CV")
         Logger.info(
             f"VIOStabilizer running at {Config.VIO_RATE_HZ} Hz — "
             f"Sources: {', '.join(sources) or 'NONE'} | "
-            f"Fusion weight: CV={Config.CV_FLOW_WEIGHT:.0%} ESP32={1-Config.CV_FLOW_WEIGHT:.0%} | "
-            f"POS(Kp={Config.VIO_POS_KP}) → "
-            f"VEL(Kp={Config.VIO_KP}, Ki={Config.VIO_KI}, Kd={Config.VIO_KD})"
+            f"ESP PID(Kp={Config.ESP_VIO_KP}, Ki={Config.ESP_VIO_KI}, "
+            f"Kd={Config.ESP_VIO_KD}) w={Config.ESP_VIO_WEIGHT} | "
+            f"ORB PID(Kp={Config.ORB_VIO_KP}, Ki={Config.ORB_VIO_KI}, "
+            f"Kd={Config.ORB_VIO_KD}) w={Config.ORB_VIO_WEIGHT}"
         )
         while self._running.is_set():
             try:
                 self._compute_corrections()
             except Exception as exc:
                 Logger.warn(f"VIOStabilizer error: {exc}")
-                self._zero_output()
+                with self._lock:
+                    self._roll_pwm = 1500
+                    self._pitch_pwm = 1500
+                    self._is_active = False
             time.sleep(Config.VIO_INTERVAL)
 
-        self._zero_output()
+        with self._lock:
+            self._roll_pwm = 1500
+            self._pitch_pwm = 1500
+            self._is_active = False
         Logger.info("VIOStabilizer stopped")
