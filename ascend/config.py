@@ -16,7 +16,7 @@ class Config:
     PIXHAWK_PORT: str = "/dev/ttyACM0"
     PIXHAWK_BAUD: int = 921600
 
-    TF02_PORT: str = "/dev/ttyAMA2"
+    TF02_PORT: str = "/dev/serial0"
     TF02_BAUD: int = 115200
 
     # ── TF-02 Frame Constants ──────────────────────────────────────────
@@ -26,7 +26,7 @@ class Config:
     TF02_MAX_CM: int = 800
 
     # ── ESP32-CAM (VIO Optical Flow) ──────────────────────────────────
-    ESP32_CAM_PORT: str = "/dev/serial0"
+    ESP32_CAM_PORT: str = "/dev/ttyAMA2"
     ESP32_CAM_BAUD: int = 921600
     ESP32_CAM_HEADER_1: int = 0xAA
     ESP32_CAM_HEADER_2: int = 0x55
@@ -35,9 +35,9 @@ class Config:
     # ── VIO Stabilization ─────────────────────────────────────────────
     VIO_RATE_HZ: int = 20                    # stabilizer loop rate
     VIO_INTERVAL: float = 1.0 / 20           # 50 ms
-    VIO_KP: float = 0.5                      # P-gain (PWM per m/s drift)
-    VIO_KI: float = 0.15                     # I-gain (eliminates steady drift)
-    VIO_KD: float = 0.3                      # D-gain (damps oscillation)
+    VIO_KP: float = 0.5                      # velocity P-gain (PWM per m/s drift)
+    VIO_KI: float = 0.15                     # velocity I-gain (eliminates steady drift)
+    VIO_KD: float = 0.3                      # velocity D-gain (damps oscillation)
     VIO_EMA_ALPHA: float = 0.4               # EMA smoothing (0–1, lower=smoother)
     VIO_INTEGRAL_MAX: float = 50.0           # anti-windup clamp for I-term (PWM)
     VIO_DEADZONE_PX: int = 2                 # ignore flow below this
@@ -45,7 +45,12 @@ class Config:
     VIO_MAX_CORRECTION_PWM: int = 100        # max ±100 PWM from neutral
     VIO_FOCAL_LENGTH_PX: float = 60.0        # OV2640 @ 96×96 approx
     VIO_DATA_TIMEOUT: float = 0.5            # stale ESP32-CAM threshold
-    VIO_MIN_ALT_M: float = 0.3              # disable VIO below 30 cm
+    VIO_MIN_ALT_M: float = 0.0              # VIO active from ground up
+
+    # ── VIO Position Hold (CV outer loop) ─────────────────────────────
+    VIO_POS_KP: float = 0.8                  # position P-gain (m/s per metre drift)
+    VIO_POS_MAX_M: float = 3.0               # position clamp — max tracked drift (m)
+    VIO_POS_DECAY: float = 0.998             # slow position decay to handle  OF drift
 
     # ── Crash Safety ──────────────────────────────────────────────────
     CRASH_DISARM_ALT_M: float = 0.15         # force-disarm if below this alt

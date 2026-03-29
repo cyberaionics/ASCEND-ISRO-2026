@@ -1,32 +1,37 @@
 """
-ASCEND Phase 2 — VIO Hover Stabilizer (PID + EMA)
+ASCEND Phase 2 — VIO Hover Stabilizer (CV Position Hold + PID Velocity)
 Daemon thread that converts ESP32-CAM optical-flow data into
 roll/pitch RC corrections for X-Y plane hover stabilization.
 
-Uses a full PID controller per axis with EMA-filtered velocity
-for much more stable hover than a pure P-controller:
-  - P-term: immediate response to current drift velocity
-  - I-term: eliminates steady-state drift (wind, CG offset)
-  - D-term: damps oscillations / overshoots
-  - EMA:    smooths noisy optical-flow readings
+Architecture: Cascaded Position → Velocity controller
+═══════════════════════════════════════════════════════
+
+  Outer loop (CV — Position Hold):
+    • Integrates optical-flow velocity into X-Y position estimate (metres)
+    • Tracks displacement from the hover origin (0, 0)
+    • Position P-controller: desired_vel = -POS_KP × position_error
+    • This is what pulls the drone BACK to where it started hovering
+
+  Inner loop (PID — Velocity Control):
+    • Error = measured_velocity − desired_velocity
+    • PID controller converts velocity error into roll/pitch PWM
+    • EMA-filtered velocity for noise rejection
+
+  Why this works:
+    Pure velocity PID only reacts to drift speed, so if the drone drifts
+    1 metre and then stops (velocity = 0), the PID outputs zero — no
+    force pulls it back. With position integration, the outer loop sees
+    "we are 1m off" and generates a return velocity command.
 
 Algorithm (runs at 20 Hz):
   1. Read (dx, dy, quality) from ESP32CamReader
-  2. Skip if quality < VIO_MIN_QUALITY (insufficient features)
-  3. Skip if ESP32-CAM data age > VIO_DATA_TIMEOUT (stale)
-  4. Skip if TF-02 altitude < VIO_MIN_ALT_M (too low)
-  5. Apply deadzone: zero out flow below VIO_DEADZONE_PX
-  6. Scale to velocity: vel = (flow_px * alt_m) / (focal_len * dt)
-  7. Apply EMA filter to smooth velocity
-  8. Apply PID controller: correction = -(Kp*vel + Ki*∫vel + Kd*d(vel)/dt)
-  9. Clamp to ±VIO_MAX_CORRECTION_PWM
-  10. Expose roll_correction, pitch_correction for scheduler
-
-Sign conventions (drone body frame → RC override):
-  - ESP32-CAM dx positive = drone drifting RIGHT  → roll LEFT  (−correction)
-  - ESP32-CAM dy positive = drone drifting FORWARD → pitch BACK (−correction)
-  - Roll  RC: 1500 + correction (positive = right roll)
-  - Pitch RC: 1500 + correction (positive = forward pitch)
+  2. Safety gates: quality, data age, altitude
+  3. Scale flow → velocity (m/s) using TF-02 altitude
+  4. EMA filter on velocity
+  5. INTEGRATE velocity → position displacement (metres from hover origin)
+  6. Outer P-loop: pos_error → desired velocity to return
+  7. Inner PID loop: vel_error → roll/pitch PWM correction
+  8. Clamp to ±VIO_MAX_CORRECTION_PWM
 """
 
 import threading
@@ -40,12 +45,11 @@ from ..hardware.tf02 import TF02Reader
 
 
 class VIOStabilizer(threading.Thread):
-    """Converts optical-flow into roll/pitch corrections for hover hold.
+    """Cascaded position + velocity controller for optical-flow hover hold.
 
-    Uses a PID controller per axis with EMA-filtered velocity for
-    stable position hold. The corrections are exposed as thread-safe
-    properties that the main state machine reads when composing
-    ``send_rc_override()`` calls.
+    Outer loop integrates flow into position estimate (CV), inner loop
+    runs PID on velocity error. Corrections are exposed as thread-safe
+    properties that the state machine reads for ``send_rc_override()``.
 
     Args:
         esp32_cam: Running ESP32CamReader instance.
@@ -64,23 +68,28 @@ class VIOStabilizer(threading.Thread):
         self._roll_correction: int = 0
         self._pitch_correction: int = 0
 
-        # Internal state for velocity estimation
+        # ── CV Position Estimate (outer loop) ─────────────────────────
+        # Accumulated displacement from hover origin in metres
+        self._pos_x: float = 0.0   # positive = right of origin
+        self._pos_y: float = 0.0   # positive = forward of origin
+
+        # ── Velocity state (inner loop) ───────────────────────────────
         self._prev_time: float = 0.0
 
         # EMA-filtered velocities (m/s)
         self._ema_vel_x: float = 0.0
         self._ema_vel_y: float = 0.0
 
-        # PID integral accumulators (PWM units)
+        # PID integral accumulators (velocity-error units × time)
         self._integral_x: float = 0.0
         self._integral_y: float = 0.0
 
-        # PID derivative: previous filtered velocity
-        self._prev_vel_x: float = 0.0
-        self._prev_vel_y: float = 0.0
+        # PID derivative: previous velocity error
+        self._prev_vel_err_x: float = 0.0
+        self._prev_vel_err_y: float = 0.0
 
         # Diagnostics
-        self._active: bool = False  # True when corrections are being applied
+        self._active: bool = False
 
     # ── Thread-safe Properties ─────────────────────────────────────────
 
@@ -103,13 +112,14 @@ class VIOStabilizer(threading.Thread):
             return self._active
 
     def get_corrections(self) -> tuple:
-        """Return ``(roll_correction, pitch_correction, active)`` atomically.
-
-        Returns:
-            Tuple of (roll_pwm_offset, pitch_pwm_offset, is_active).
-        """
+        """Return ``(roll_correction, pitch_correction, active)`` atomically."""
         with self._lock:
             return (self._roll_correction, self._pitch_correction, self._active)
+
+    def get_position(self) -> tuple:
+        """Return ``(pos_x, pos_y)`` — current estimated position in metres."""
+        with self._lock:
+            return (self._pos_x, self._pos_y)
 
     # ── Public API ─────────────────────────────────────────────────────
 
@@ -117,10 +127,27 @@ class VIOStabilizer(threading.Thread):
         """Signal the stabilizer thread to stop."""
         self._running.clear()
 
+    def reset_position(self) -> None:
+        """Reset the CV position origin to current location.
+
+        Called when entering HOVER state so the drone holds from
+        wherever it stabilised, not from where it took off.
+        """
+        with self._lock:
+            self._pos_x = 0.0
+            self._pos_y = 0.0
+            self._integral_x = 0.0
+            self._integral_y = 0.0
+            self._prev_vel_err_x = 0.0
+            self._prev_vel_err_y = 0.0
+            self._ema_vel_x = 0.0
+            self._ema_vel_y = 0.0
+        Logger.info("VIO: position origin reset to (0, 0)")
+
     # ── Core Algorithm ─────────────────────────────────────────────────
 
     def _compute_corrections(self) -> None:
-        """Run one iteration of the VIO PID stabilization loop."""
+        """One iteration of the cascaded position → velocity controller."""
         now = time.time()
 
         # ── Gate 1: ESP32-CAM data freshness ──────────────────────────
@@ -131,7 +158,7 @@ class VIOStabilizer(threading.Thread):
         # ── Gate 2: Read flow data ────────────────────────────────────
         dx, dy, quality = self._cam.get_flow()
 
-        # ── Gate 3: Quality check (minimum tracked features) ──────────
+        # ── Gate 3: Quality check ─────────────────────────────────────
         if quality < Config.VIO_MIN_QUALITY:
             self._zero_output()
             return
@@ -144,62 +171,94 @@ class VIOStabilizer(threading.Thread):
 
         # ── Gate 5: Time delta ────────────────────────────────────────
         if self._prev_time == 0.0:
-            # First iteration — just initialise and skip
             self._prev_time = now
             self._zero_output()
             return
 
         dt = now - self._prev_time
         if dt <= 0.001 or dt > 0.5:
-            # Invalid or too-large time gap — reset
             self._prev_time = now
-            self._reset_pid()
+            self._reset_state()
             self._zero_output()
             return
 
-        # ── Compute flow with deadzone ────────────────────────────────
+        # ══════════════════════════════════════════════════════════════
+        # STEP 1: Flow → Velocity (with deadzone + EMA)
+        # ══════════════════════════════════════════════════════════════
         flow_x = dx if abs(dx) >= Config.VIO_DEADZONE_PX else 0
         flow_y = dy if abs(dy) >= Config.VIO_DEADZONE_PX else 0
 
-        # ── Scale to approximate velocity (m/s) ──────────────────────
-        #   velocity ≈ (pixel_displacement × altitude) / (focal_length × dt)
+        # Standard optical-flow to ground-velocity conversion
         scale = alt_m / (Config.VIO_FOCAL_LENGTH_PX * dt)
-        raw_vel_x = flow_x * scale  # lateral velocity, positive = right
-        raw_vel_y = flow_y * scale  # longitudinal velocity, positive = forward
+        raw_vel_x = flow_x * scale
+        raw_vel_y = flow_y * scale
 
-        # ── EMA filter to smooth noisy optical flow ───────────────────
+        # EMA filter
         alpha = Config.VIO_EMA_ALPHA
         self._ema_vel_x = alpha * raw_vel_x + (1.0 - alpha) * self._ema_vel_x
         self._ema_vel_y = alpha * raw_vel_y + (1.0 - alpha) * self._ema_vel_y
         vel_x = self._ema_vel_x
         vel_y = self._ema_vel_y
 
-        # ── PID controller (per-axis) ─────────────────────────────────
-        # P-term: proportional to current velocity
-        p_x = Config.VIO_KP * vel_x
-        p_y = Config.VIO_KP * vel_y
+        # ══════════════════════════════════════════════════════════════
+        # STEP 2: CV — Integrate velocity → position (outer loop)
+        # ══════════════════════════════════════════════════════════════
+        # Accumulate displacement from hover origin
+        self._pos_x += vel_x * dt
+        self._pos_y += vel_y * dt
 
-        # I-term: integral of velocity (≈ position drift) with anti-windup
-        self._integral_x += vel_x * dt
-        self._integral_y += vel_y * dt
-        int_max = Config.VIO_INTEGRAL_MAX / max(Config.VIO_KI, 0.001)  # scale to vel units
+        # Slow exponential decay to handle optical flow integration drift
+        # over long hover durations. Without this, small systematic OF
+        # bias would accumulate into a large phantom position offset.
+        self._pos_x *= Config.VIO_POS_DECAY
+        self._pos_y *= Config.VIO_POS_DECAY
+
+        # Clamp position to sane range
+        pos_max = Config.VIO_POS_MAX_M
+        self._pos_x = max(-pos_max, min(pos_max, self._pos_x))
+        self._pos_y = max(-pos_max, min(pos_max, self._pos_y))
+
+        # ══════════════════════════════════════════════════════════════
+        # STEP 3: Outer P-loop — position error → desired velocity
+        # ══════════════════════════════════════════════════════════════
+        # If drone is 0.5m RIGHT of origin (pos_x=+0.5), we want it to
+        # move LEFT → desired velocity is negative (towards origin).
+        desired_vel_x = -Config.VIO_POS_KP * self._pos_x
+        desired_vel_y = -Config.VIO_POS_KP * self._pos_y
+
+        # ══════════════════════════════════════════════════════════════
+        # STEP 4: Inner PID loop — velocity error → PWM correction
+        # ══════════════════════════════════════════════════════════════
+        vel_err_x = vel_x - desired_vel_x
+        vel_err_y = vel_y - desired_vel_y
+
+        # P-term
+        p_x = Config.VIO_KP * vel_err_x
+        p_y = Config.VIO_KP * vel_err_y
+
+        # I-term with anti-windup
+        self._integral_x += vel_err_x * dt
+        self._integral_y += vel_err_y * dt
+        int_max = Config.VIO_INTEGRAL_MAX / max(Config.VIO_KI, 0.001)
         self._integral_x = max(-int_max, min(int_max, self._integral_x))
         self._integral_y = max(-int_max, min(int_max, self._integral_y))
         i_x = Config.VIO_KI * self._integral_x
         i_y = Config.VIO_KI * self._integral_y
 
-        # D-term: derivative of filtered velocity (rate of acceleration)
-        d_vel_x = (vel_x - self._prev_vel_x) / dt
-        d_vel_y = (vel_y - self._prev_vel_y) / dt
-        d_x = Config.VIO_KD * d_vel_x
-        d_y = Config.VIO_KD * d_vel_y
+        # D-term (derivative of velocity error)
+        d_err_x = (vel_err_x - self._prev_vel_err_x) / dt
+        d_err_y = (vel_err_y - self._prev_vel_err_y) / dt
+        d_x = Config.VIO_KD * d_err_x
+        d_y = Config.VIO_KD * d_err_y
 
-        # ── Combine PID output ────────────────────────────────────────
-        # Negative feedback: drift RIGHT (vel_x > 0) → roll LEFT (−correction)
+        # ══════════════════════════════════════════════════════════════
+        # STEP 5: Combine + clamp
+        # ══════════════════════════════════════════════════════════════
+        # Negative feedback: positive vel_err (drifting right/forward)
+        # → negative roll/pitch (tilt left/back to counteract)
         raw_roll = -(p_x + i_x + d_x)
         raw_pitch = -(p_y + i_y + d_y)
 
-        # ── Clamp to safe range ───────────────────────────────────────
         max_corr = Config.VIO_MAX_CORRECTION_PWM
         roll_corr = int(max(-max_corr, min(max_corr, raw_roll)))
         pitch_corr = int(max(-max_corr, min(max_corr, raw_pitch)))
@@ -210,17 +269,17 @@ class VIOStabilizer(threading.Thread):
             self._pitch_correction = pitch_corr
             self._active = True
 
-        # Update previous state for derivative
-        self._prev_vel_x = vel_x
-        self._prev_vel_y = vel_y
+        # Update state
+        self._prev_vel_err_x = vel_err_x
+        self._prev_vel_err_y = vel_err_y
         self._prev_time = now
 
-    def _reset_pid(self) -> None:
-        """Reset PID state (integral and derivative memory)."""
+    def _reset_state(self) -> None:
+        """Reset velocity/PID state (not position — that persists)."""
         self._integral_x = 0.0
         self._integral_y = 0.0
-        self._prev_vel_x = 0.0
-        self._prev_vel_y = 0.0
+        self._prev_vel_err_x = 0.0
+        self._prev_vel_err_y = 0.0
         self._ema_vel_x = 0.0
         self._ema_vel_y = 0.0
 
@@ -236,9 +295,10 @@ class VIOStabilizer(threading.Thread):
     def run(self) -> None:
         """Run the VIO stabilization loop at VIO_RATE_HZ."""
         Logger.info(
-            f"VIOStabilizer running at {Config.VIO_RATE_HZ} Hz "
-            f"(Kp={Config.VIO_KP}, Ki={Config.VIO_KI}, Kd={Config.VIO_KD}, "
-            f"EMA={Config.VIO_EMA_ALPHA}, max_corr=±{Config.VIO_MAX_CORRECTION_PWM} PWM)"
+            f"VIOStabilizer running at {Config.VIO_RATE_HZ} Hz — "
+            f"Cascaded POS(Kp={Config.VIO_POS_KP}) → "
+            f"VEL(Kp={Config.VIO_KP}, Ki={Config.VIO_KI}, Kd={Config.VIO_KD}), "
+            f"EMA={Config.VIO_EMA_ALPHA}, max=±{Config.VIO_MAX_CORRECTION_PWM} PWM"
         )
         while self._running.is_set():
             try:

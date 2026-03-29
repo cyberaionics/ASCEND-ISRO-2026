@@ -134,13 +134,18 @@ class StateMachine:
         # ── VIO telemetry ─────────────────────────────────────────
         if self._vio is not None:
             roll_c, pitch_c, vio_active = self._vio.get_corrections()
+            pos_x, pos_y = self._vio.get_position()
             telem["vio_active"] = vio_active
             telem["vio_roll_corr"] = roll_c
             telem["vio_pitch_corr"] = pitch_c
+            telem["vio_pos_x"] = round(pos_x, 3)
+            telem["vio_pos_y"] = round(pos_y, 3)
         else:
             telem["vio_active"] = False
             telem["vio_roll_corr"] = 0
             telem["vio_pitch_corr"] = 0
+            telem["vio_pos_x"] = 0.0
+            telem["vio_pos_y"] = 0.0
         return telem
 
     def run(self) -> None:
@@ -388,9 +393,12 @@ class StateMachine:
             self._alt_stable_since = None
 
     def _state_hover(self) -> None:
-        """HOVER — hold altitude (Z) + VIO position hold (X-Y)."""
+        """HOVER — hold altitude (Z) + CV position hold (X-Y)."""
         if self._hover_start is None:
             self._hover_start = time.time()
+            # Reset VIO position origin — hold from HERE
+            if self._vio is not None:
+                self._vio.reset_position()
             Logger.info(f"Hovering for {Config.HOVER_DURATION:.0f}s …")
 
         tf02 = self._tf02.distance_m
@@ -414,7 +422,8 @@ class StateMachine:
         vio_tag = ""
         if self._vio is not None and self._vio.active:
             rc, pc, _ = self._vio.get_corrections()
-            vio_tag = f" vio_r={rc:+d} vio_p={pc:+d}"
+            px, py = self._vio.get_position()
+            vio_tag = f" vio_r={rc:+d} vio_p={pc:+d} pos=({px:+.2f},{py:+.2f})m"
         Logger.info(
             f"HOVER alt={alt:.2f}m error={error:.2f}m throttle={throttle}"
             f" roll={roll} pitch={pitch}{vio_tag} elapsed={elapsed:.0f}s"
