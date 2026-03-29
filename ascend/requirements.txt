@@ -1,0 +1,6 @@
+# ASCEND — Python Dependencies
+# Install: pip3 install -r requirements.txt
+
+# ── Core Flight Stack ─────────────────────────────────────────────
+pymavlink>=2.4.41           # MAVLink protocol for Pixhawk communication
+pyserial>=3.5               # Serial UART for TF-02 LiDAR and ESP32-CAM

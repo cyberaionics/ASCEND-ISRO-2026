@@ -1,6 +1,7 @@
 """
-ASCEND Phase 1 — Scheduler & State Machine
+ASCEND Phase 2 — Scheduler & State Machine
 Entry point for all CLI modes. Run as: python3 -m ascend.scheduler --mode <mode>
+Includes VIO-based X-Y hover stabilization via ESP32-CAM optical flow.
 """
 
 import argparse
@@ -16,12 +17,14 @@ from .config import Config
 from .logger import Logger
 from .hardware.tf02 import TF02Reader
 from .hardware.pixhawk import PixhawkLink
+from .hardware.esp32_cam import ESP32CamReader
 from .threads.bridge import (
     HeartbeatSender,
     RangefinderBridge,
     SafetyMonitor,
     TelemetryStreamer,
 )
+from .threads.vio_stabilizer import VIOStabilizer
 from .checks.health import HealthChecker
 from .checks.setup import AutoTuneSetup
 from .checks.monitor import AutoTuneMonitor
@@ -47,7 +50,7 @@ class State(enum.Enum):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class StateMachine:
-    """Central flight sequencer that runs the Phase 1 hover mission.
+    """Central flight sequencer that runs the Phase 2 hover mission.
 
     Manages state transitions according to the ASCEND flight-state spec:
     IDLE → PREFLIGHT → TAKEOFF → HOVER → RETURN → LAND → IDLE.
@@ -58,16 +61,25 @@ class StateMachine:
                     slide UP   = manual RC control
       - FS_GCS_ENABLE at the Pixhawk firmware level (if RPi5 crashes)
 
+    VIO stabilization:
+      - ESP32-CAM optical flow → VIOStabilizer → roll/pitch corrections
+      - Applied during TAKEOFF and HOVER states via RC override
+      - Corrections are zero when VIO data is invalid (graceful degradation)
+
     Args:
         pixhawk: Connected PixhawkLink instance.
         tf02:    Running TF02Reader instance.
         safety:  Running SafetyMonitor instance.
+        vio:     Running VIOStabilizer instance (optional, for X-Y hold).
     """
 
-    def __init__(self, pixhawk: PixhawkLink, tf02: TF02Reader, safety: SafetyMonitor) -> None:
+    def __init__(self, pixhawk: PixhawkLink, tf02: TF02Reader,
+                 safety: SafetyMonitor,
+                 vio: Optional[VIOStabilizer] = None) -> None:
         self._px = pixhawk
         self._tf02 = tf02
         self._safety = safety
+        self._vio = vio
         self._state = State.IDLE
         self._manual_mode: bool = False
         self._running: bool = True
@@ -102,7 +114,7 @@ class StateMachine:
 
     def get_telemetry(self) -> dict:
         """Build a telemetry dict for the TelemetryStreamer."""
-        return {
+        telem = {
             "state":        self._state.value,
             "altitude_m":   self._altitude_m,
             "battery_pct":  self._battery_pct,
@@ -116,6 +128,17 @@ class StateMachine:
             "vib_z":        self._vib_z,
             "rc_ch8":       self._rc_ch8,
         }
+        # ── VIO telemetry ─────────────────────────────────────────
+        if self._vio is not None:
+            roll_c, pitch_c, vio_active = self._vio.get_corrections()
+            telem["vio_active"] = vio_active
+            telem["vio_roll_corr"] = roll_c
+            telem["vio_pitch_corr"] = pitch_c
+        else:
+            telem["vio_active"] = False
+            telem["vio_roll_corr"] = 0
+            telem["vio_pitch_corr"] = 0
+        return telem
 
     def run(self) -> None:
         """Execute the state machine main loop."""
@@ -293,6 +316,19 @@ class StateMachine:
         Logger.error("Arming FAILED within timeout — returning to IDLE")
         self._transition(State.IDLE)
 
+    def _get_vio_roll_pitch(self) -> tuple:
+        """Return (roll_pwm, pitch_pwm) with VIO corrections applied.
+
+        If VIO is unavailable or inactive, returns neutral (1500, 1500).
+        """
+        roll = 1500
+        pitch = 1500
+        if self._vio is not None:
+            roll_c, pitch_c, _ = self._vio.get_corrections()
+            roll = max(1000, min(2000, 1500 + roll_c))
+            pitch = max(1000, min(2000, 1500 + pitch_c))
+        return roll, pitch
+
     def _state_takeoff(self) -> None:
         """TAKEOFF — gradual throttle ramp until liftoff then climb to target."""
         tf02 = self._tf02.distance_m
@@ -308,6 +344,9 @@ class StateMachine:
             self._ground_alt = alt
             Logger.info(f"Starting throttle ramp from 1100. Ground={alt:.2f}m")
 
+        # Get VIO-corrected roll/pitch for X-Y stabilization
+        roll, pitch = self._get_vio_roll_pitch()
+
         if not self._lifted:
             if alt > self._ground_alt + 0.15:
                 self._lifted = True
@@ -316,7 +355,9 @@ class StateMachine:
                 self._ramp_throttle += 1
                 self._ramp_throttle = min(self._ramp_throttle, 1900)
                 Logger.info(f"Ramping... alt={alt:.2f}m throttle={self._ramp_throttle}")
-                self._px.send_rc_override(throttle=self._ramp_throttle)
+                self._px.send_rc_override(
+                    roll=roll, pitch=pitch, throttle=self._ramp_throttle
+                )
                 return
 
         error = target - alt
@@ -325,7 +366,7 @@ class StateMachine:
         throttle = max(1100, min(1900, throttle))
 
         Logger.info(f"CLIMBING alt={alt:.2f}m target={target:.2f}m error={error:.2f}m throttle={throttle}")
-        self._px.send_rc_override(throttle=throttle)
+        self._px.send_rc_override(roll=roll, pitch=pitch, throttle=throttle)
 
         if abs(error) <= Config.ALT_TOLERANCE_M:
             if self._alt_stable_since is None:
@@ -341,7 +382,7 @@ class StateMachine:
             self._alt_stable_since = None
 
     def _state_hover(self) -> None:
-        """HOVER — hold altitude using saved hover throttle + P-controller."""
+        """HOVER — hold altitude (Z) + VIO position hold (X-Y)."""
         if self._hover_start is None:
             self._hover_start = time.time()
             Logger.info(f"Hovering for {Config.HOVER_DURATION:.0f}s …")
@@ -360,10 +401,22 @@ class StateMachine:
         throttle = int(base + KP * error)
         throttle = max(1100, min(1900, throttle))
 
-        elapsed = time.time() - self._hover_start
-        Logger.info(f"HOVER alt={alt:.2f}m error={error:.2f}m throttle={throttle} elapsed={elapsed:.0f}s")
+        # Get VIO-corrected roll/pitch for X-Y stabilization
+        roll, pitch = self._get_vio_roll_pitch()
 
-        self._px.send_rc_override(throttle=throttle)
+        elapsed = time.time() - self._hover_start
+        vio_tag = ""
+        if self._vio is not None and self._vio.active:
+            rc, pc, _ = self._vio.get_corrections()
+            vio_tag = f" vio_r={rc:+d} vio_p={pc:+d}"
+        Logger.info(
+            f"HOVER alt={alt:.2f}m error={error:.2f}m throttle={throttle}"
+            f" roll={roll} pitch={pitch}{vio_tag} elapsed={elapsed:.0f}s"
+        )
+
+        self._px.send_rc_override(
+            roll=roll, pitch=pitch, throttle=throttle
+        )
 
         if 0 < self._battery_volt < Config.LOW_BATTERY_VOLT:
             Logger.warn(f"Low battery ({self._battery_volt:.2f}V) → RETURN")
@@ -436,6 +489,7 @@ class Scheduler:
         self._mode = mode.lower()
         self._threads: list = []
         self._tf02: Optional[TF02Reader] = None
+        self._esp32_cam: Optional[ESP32CamReader] = None
         self._pixhawk: Optional[PixhawkLink] = None
 
     def run(self) -> int:
@@ -502,16 +556,23 @@ class Scheduler:
         if not self._connect_pixhawk():
             return 1
         self._start_tf02()
+        self._start_esp32_cam()
         time.sleep(5.0)
 
         safety = SafetyMonitor(self._tf02, self._pixhawk)
         safety.start()
         self._threads.append(safety)
 
+        # Start VIO stabilizer (X-Y hover hold via optical flow)
+        vio = VIOStabilizer(self._esp32_cam, self._tf02)
+        vio.start()
+        self._threads.append(vio)
+        Logger.ok("VIO stabilizer started — X-Y hover hold active")
+
         self._start_bridge()
         self._start_heartbeat()
 
-        sm = StateMachine(self._pixhawk, self._tf02, safety)
+        sm = StateMachine(self._pixhawk, self._tf02, safety, vio=vio)
         telem = TelemetryStreamer(sm.get_telemetry)
         telem.start()
         self._threads.append(telem)
@@ -537,6 +598,12 @@ class Scheduler:
         hb = HeartbeatSender(self._pixhawk)
         hb.start()
         self._threads.append(hb)
+
+    def _start_esp32_cam(self) -> None:
+        """Start the ESP32-CAM optical-flow reader thread."""
+        self._esp32_cam = ESP32CamReader()
+        self._esp32_cam.start()
+        self._threads.append(self._esp32_cam)
 
     def _cleanup(self) -> None:
         Logger.info("Cleaning up …")

@@ -25,6 +25,24 @@ class Config:
     TF02_MIN_CM: int = 30
     TF02_MAX_CM: int = 800
 
+    # ── ESP32-CAM (VIO Optical Flow) ──────────────────────────────────
+    ESP32_CAM_PORT: str = "/dev/ttyAMA2"
+    ESP32_CAM_BAUD: int = 115200
+    ESP32_CAM_HEADER_1: int = 0xAA
+    ESP32_CAM_HEADER_2: int = 0x55
+    ESP32_CAM_FRAME_LEN: int = 8
+
+    # ── VIO Stabilization ─────────────────────────────────────────────
+    VIO_RATE_HZ: int = 20                    # stabilizer loop rate
+    VIO_INTERVAL: float = 1.0 / 20           # 50 ms
+    VIO_KP: float = 0.5                      # P-gain (PWM per m/s drift)
+    VIO_DEADZONE_PX: int = 2                 # ignore flow below this
+    VIO_MIN_QUALITY: int = 5                 # minimum tracked features
+    VIO_MAX_CORRECTION_PWM: int = 100        # max ±100 PWM from neutral
+    VIO_FOCAL_LENGTH_PX: float = 60.0        # OV2640 @ 96×96 approx
+    VIO_DATA_TIMEOUT: float = 0.5            # stale ESP32-CAM threshold
+    VIO_MIN_ALT_M: float = 0.3              # disable VIO below 30 cm
+
     # ── MAVLink System IDs ─────────────────────────────────────────────
     SYSTEM_ID: int = 1           # Pixhawk system ID
     COMPANION_SYSID: int = 255   # RPi5 companion computer
