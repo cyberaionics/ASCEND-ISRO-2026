@@ -127,9 +127,12 @@ class Config:
     BASE_THROTTLE_PWM: int = 1550
     MIN_THROTTLE_PWM: int = 1100
     MAX_THROTTLE_PWM: int = 1800
-    TAKEOFF_TIMEOUT_S: float = 15.0
-    TAKEOFF_ALT_THRESHOLD: float = 0.90
-    LAND_DURATION_S: float = 5.0
+    TAKEOFF_START_PWM: int = 1400       # Start ramp near spool-up, not 1100
+    TAKEOFF_RAMP_PWM_PER_S: int = 50    # PWM increase per second during ramp
+    TAKEOFF_TIMEOUT_S: float = 30.0     # 30s — enough time to climb
+    TAKEOFF_ALT_THRESHOLD: float = 0.70 # 70% of target alt to enter HOVER
+    LAND_DURATION_S: float = 8.0        # 8s linear descent
+    LAND_THROTTLE_DROP_PER_S: int = 50  # PWM decrease per second during land
     ARM_TIMEOUT_S: float = 10.0
     DISARM_TIMEOUT_S: float = 5.0
     TOUCHDOWN_ALT_M: float = 0.10

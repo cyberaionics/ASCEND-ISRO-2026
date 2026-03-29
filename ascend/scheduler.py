@@ -111,7 +111,7 @@ class StateMachine:
         self._total_ticks: int = 0
 
         # Takeoff ramp state
-        self._ramp_throttle: int = Config.MIN_THROTTLE_PWM
+        self._ramp_throttle: int = Config.TAKEOFF_START_PWM
         self._current_throttle: int = Config.MIN_THROTTLE_PWM
 
     # ── Public API ─────────────────────────────────────────────────────
@@ -357,10 +357,14 @@ class StateMachine:
             self._transition(State.DISARM)
 
     def _state_takeoff(self) -> None:
-        """TAKEOFF — throttle ramp in STABILIZE + VIO roll/pitch corrections.
+        """TAKEOFF — 2-phase throttle strategy in STABILIZE mode.
 
-        Ramp throttle from MIN to BASE, apply altitude P-controller during
-        climb.  Transition to HOVER when altitude >= TAKEOFF_ALT_THRESHOLD.
+        Phase 1 (ramp): Increase throttle from TAKEOFF_START_PWM at
+            TAKEOFF_RAMP_PWM_PER_S until the drone lifts off (alt > 0.15m).
+        Phase 2 (climb): Switch to altitude P-controller to climb smoothly
+            to HOVER_TARGET_ALT_M.
+
+        Transition to HOVER when altitude >= TAKEOFF_ALT_THRESHOLD.
         """
         elapsed = time.time() - self._state_enter_time
         alt_m = self._tf02.distance_m
@@ -381,34 +385,53 @@ class StateMachine:
         # Timeout check
         if elapsed > Config.TAKEOFF_TIMEOUT_S:
             Logger.error(
-                f"TAKEOFF timeout ({Config.TAKEOFF_TIMEOUT_S:.0f}s) — LAND"
+                f"TAKEOFF timeout ({Config.TAKEOFF_TIMEOUT_S:.0f}s) — "
+                f"max alt reached: {self._max_alt:.2f}m — LAND"
             )
             self._transition(State.LAND)
             return
 
         # Altitude reached → HOVER
         if alt_m >= Config.TAKEOFF_ALT_THRESHOLD:
-            Logger.ok(f"Altitude {alt_m:.2f}m >= {Config.TAKEOFF_ALT_THRESHOLD}m → HOVER")
+            Logger.ok(
+                f"Altitude {alt_m:.2f}m >= "
+                f"{Config.TAKEOFF_ALT_THRESHOLD}m → HOVER"
+            )
             self._current_throttle = self._ramp_throttle
             self._transition(State.HOVER)
             return
 
-        # Throttle ramp: climb towards target
-        error = Config.HOVER_TARGET_ALT_M - alt_m
-        target_throttle = int(Config.BASE_THROTTLE_PWM + Config.HOVER_KP_ALT * error)
-
-        # Ramp smoothly (don't jump instantly to target)
-        if self._ramp_throttle < target_throttle:
+        # ── Phase 1: Ramp until airborne (alt > 0.15m) ────────────────
+        if alt_m < 0.15:
             self._ramp_throttle = min(
-                self._ramp_throttle + 5,   # ~5 PWM per tick at 20Hz
-                target_throttle,
-                Config.MAX_THROTTLE_PWM
+                Config.TAKEOFF_START_PWM + int(
+                    elapsed * Config.TAKEOFF_RAMP_PWM_PER_S
+                ),
+                Config.MAX_THROTTLE_PWM,
             )
+
+        # ── Phase 2: Altitude P-controller for climb ──────────────────
         else:
-            self._ramp_throttle = max(
-                target_throttle,
-                Config.MIN_THROTTLE_PWM
+            error = Config.HOVER_TARGET_ALT_M - alt_m
+            target_thr = int(
+                Config.BASE_THROTTLE_PWM + Config.HOVER_KP_ALT * error
             )
+            target_thr = max(
+                Config.MIN_THROTTLE_PWM,
+                min(Config.MAX_THROTTLE_PWM, target_thr)
+            )
+
+            # Smooth transition: ramp toward target at limited rate
+            step = max(1, int(Config.TAKEOFF_RAMP_PWM_PER_S
+                              * Config.MAIN_LOOP_INTERVAL))
+            if self._ramp_throttle < target_thr:
+                self._ramp_throttle = min(
+                    self._ramp_throttle + step, target_thr
+                )
+            elif self._ramp_throttle > target_thr:
+                self._ramp_throttle = max(
+                    self._ramp_throttle - step, target_thr
+                )
 
         roll, pitch = self._get_vio_roll_pitch()
         self._px.send_rc_override(
@@ -416,10 +439,13 @@ class StateMachine:
             throttle=self._ramp_throttle
         )
 
-        Logger.info(
-            f"TAKEOFF alt={alt_m:.2f}m throttle={self._ramp_throttle} "
-            f"elapsed={elapsed:.1f}s"
-        )
+        # 1 Hz logging (reduce log spam)
+        if int(elapsed * 2) != int((elapsed - Config.MAIN_LOOP_INTERVAL) * 2):
+            Logger.info(
+                f"TAKEOFF alt={alt_m:.2f}m throttle={self._ramp_throttle} "
+                f"phase={'ramp' if alt_m < 0.15 else 'climb'} "
+                f"elapsed={elapsed:.1f}s"
+            )
 
     def _state_hover(self) -> None:
         """HOVER — altitude P-controller + VIO roll/pitch corrections.
@@ -485,36 +511,41 @@ class StateMachine:
             self._transition(State.LAND)
 
     def _state_land(self) -> None:
-        """LAND — linear throttle reduction over LAND_DURATION_S seconds.
+        """LAND — controlled throttle reduction from current throttle.
 
-        When alt < 0.08m or throttle at minimum → DISARM.
+        Decreases throttle at LAND_THROTTLE_DROP_PER_S until touchdown
+        (alt < 0.10m) or throttle reaches MIN.  Does NOT clear RC override
+        on entry — maintains control throughout descent.
         """
         if self._land_start is None:
             self._land_start = time.time()
-            self._current_throttle = max(
+            # Use actual current throttle, not hardcoded BASE
+            self._land_start_thr = max(
                 self._ramp_throttle, Config.BASE_THROTTLE_PWM
             )
-            self._px.clear_rc_override()
             Logger.info(
-                f"LAND: reducing throttle from {self._current_throttle} "
-                f"over {Config.LAND_DURATION_S:.0f}s"
+                f"LAND: descending from throttle={self._land_start_thr}, "
+                f"drop rate={Config.LAND_THROTTLE_DROP_PER_S} PWM/s"
             )
 
         elapsed = time.time() - self._land_start
         alt_m = self._tf02.distance_m
 
-        # Linear throttle reduction
-        fraction = min(elapsed / Config.LAND_DURATION_S, 1.0)
-        start_thr = Config.BASE_THROTTLE_PWM
-        throttle = int(start_thr - fraction * (start_thr - Config.MIN_THROTTLE_PWM))
-        throttle = max(Config.MIN_THROTTLE_PWM, throttle)
+        # Linear throttle reduction from actual current throttle
+        drop = int(elapsed * Config.LAND_THROTTLE_DROP_PER_S)
+        throttle = max(Config.MIN_THROTTLE_PWM, self._land_start_thr - drop)
+
+        # Track altitude stats
+        if alt_m is not None:
+            self._min_alt = min(self._min_alt, alt_m)
+            self._max_alt = max(self._max_alt, alt_m)
 
         self._px.send_rc_override(throttle=throttle)
 
         # Check touchdown conditions
         touchdown = False
-        if alt_m is not None and alt_m < 0.08:
-            Logger.ok(f"Near ground (alt={alt_m:.2f}m) — cutting motors")
+        if alt_m is not None and alt_m < Config.TOUCHDOWN_ALT_M:
+            Logger.ok(f"Touchdown detected (alt={alt_m:.2f}m) — cutting motors")
             touchdown = True
         elif throttle <= Config.MIN_THROTTLE_PWM:
             Logger.ok("Throttle at minimum — cutting motors")
@@ -525,10 +556,14 @@ class StateMachine:
             self._land_start = None
             self._transition(State.DISARM)
         else:
-            Logger.info(
-                f"LAND alt={alt_m:.2f}m thr={throttle} "
-                f"elapsed={elapsed:.1f}s"
-            ) if alt_m is not None else None
+            # 2 Hz logging
+            if int(elapsed * 2) != int(
+                (elapsed - Config.MAIN_LOOP_INTERVAL) * 2
+            ):
+                Logger.info(
+                    f"LAND alt={alt_m:.2f}m thr={throttle} "
+                    f"elapsed={elapsed:.1f}s"
+                ) if alt_m is not None else None
 
     def _state_disarm(self) -> None:
         """DISARM — send disarm command, wait for confirmation."""
