@@ -1,7 +1,7 @@
 """
 ASCEND Phase 2 — Scheduler & State Machine
 Entry point for all CLI modes. Run as: python3 -m ascend.scheduler --mode <mode>
-Includes VIO-based X-Y hover stabilization via ESP32-CAM optical flow.
+Includes VIO hover stabilization via fused ESP32-CAM + RPi5 OpenCV optical flow.
 """
 
 import argparse
@@ -18,6 +18,7 @@ from .logger import Logger
 from .hardware.tf02 import TF02Reader
 from .hardware.pixhawk import PixhawkLink
 from .hardware.esp32_cam import ESP32CamReader
+from .hardware.cv_flow import CVFlowProcessor
 from .threads.bridge import (
     HeartbeatSender,
     RangefinderBridge,
@@ -136,12 +137,14 @@ class StateMachine:
             roll_c, pitch_c, vio_active = self._vio.get_corrections()
             pos_x, pos_y = self._vio.get_position()
             telem["vio_active"] = vio_active
+            telem["vio_source"] = self._vio.source
             telem["vio_roll_corr"] = roll_c
             telem["vio_pitch_corr"] = pitch_c
             telem["vio_pos_x"] = round(pos_x, 3)
             telem["vio_pos_y"] = round(pos_y, 3)
         else:
             telem["vio_active"] = False
+            telem["vio_source"] = "none"
             telem["vio_roll_corr"] = 0
             telem["vio_pitch_corr"] = 0
             telem["vio_pos_x"] = 0.0
@@ -423,7 +426,8 @@ class StateMachine:
         if self._vio is not None and self._vio.active:
             rc, pc, _ = self._vio.get_corrections()
             px, py = self._vio.get_position()
-            vio_tag = f" vio_r={rc:+d} vio_p={pc:+d} pos=({px:+.2f},{py:+.2f})m"
+            src = self._vio.source
+            vio_tag = f" vio_r={rc:+d} vio_p={pc:+d} pos=({px:+.2f},{py:+.2f})m src={src}"
         Logger.info(
             f"HOVER alt={alt:.2f}m error={error:.2f}m throttle={throttle}"
             f" roll={roll} pitch={pitch}{vio_tag} elapsed={elapsed:.0f}s"
@@ -549,6 +553,7 @@ class Scheduler:
         self._threads: list = []
         self._tf02: Optional[TF02Reader] = None
         self._esp32_cam: Optional[ESP32CamReader] = None
+        self._cv_flow: Optional[CVFlowProcessor] = None
         self._pixhawk: Optional[PixhawkLink] = None
 
     def run(self) -> int:
@@ -616,17 +621,22 @@ class Scheduler:
             return 1
         self._start_tf02()
         self._start_esp32_cam()
+        self._start_cv_flow()
         time.sleep(5.0)
 
         safety = SafetyMonitor(self._tf02, self._pixhawk)
         safety.start()
         self._threads.append(safety)
 
-        # Start VIO stabilizer (X-Y hover hold via optical flow)
-        vio = VIOStabilizer(self._esp32_cam, self._tf02)
+        # Start VIO stabilizer with fused CV + ESP32-CAM flow
+        vio = VIOStabilizer(
+            esp32_cam=self._esp32_cam,
+            tf02=self._tf02,
+            cv_flow=self._cv_flow,
+        )
         vio.start()
         self._threads.append(vio)
-        Logger.ok("VIO stabilizer started — X-Y hover hold active")
+        Logger.ok("VIO stabilizer started — fused CV + ESP32-CAM hover hold active")
 
         self._start_bridge()
         self._start_heartbeat()
@@ -663,6 +673,17 @@ class Scheduler:
         self._esp32_cam = ESP32CamReader()
         self._esp32_cam.start()
         self._threads.append(self._esp32_cam)
+
+    def _start_cv_flow(self) -> None:
+        """Start the RPi5 OpenCV optical-flow processor thread."""
+        try:
+            self._cv_flow = CVFlowProcessor(camera_id=Config.CV_CAMERA_ID)
+            self._cv_flow.start()
+            self._threads.append(self._cv_flow)
+            Logger.ok(f"CV flow processor started on camera {Config.CV_CAMERA_ID}")
+        except Exception as exc:
+            Logger.warn(f"CV flow processor failed to start: {exc} — using ESP32-CAM only")
+            self._cv_flow = None
 
     def _cleanup(self) -> None:
         Logger.info("Cleaning up …")

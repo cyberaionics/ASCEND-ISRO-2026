@@ -50,7 +50,21 @@ class Config:
     # ── VIO Position Hold (CV outer loop) ─────────────────────────────
     VIO_POS_KP: float = 0.8                  # position P-gain (m/s per metre drift)
     VIO_POS_MAX_M: float = 3.0               # position clamp — max tracked drift (m)
-    VIO_POS_DECAY: float = 0.998             # slow position decay to handle  OF drift
+    VIO_POS_DECAY: float = 0.998             # slow position decay to handle OF drift
+
+    # ── OpenCV Optical Flow (RPi5 camera) ─────────────────────────────
+    CV_CAMERA_ID: int = 0                    # /dev/video0 (Pi Camera or USB)
+    CV_FRAME_WIDTH: int = 160                # capture resolution (small = fast)
+    CV_FRAME_HEIGHT: int = 120
+    CV_FPS: int = 30                         # target capture FPS
+    CV_MAX_CORNERS: int = 80                 # Shi-Tomasi: max features to track
+    CV_QUALITY_LEVEL: float = 0.05           # Shi-Tomasi: quality threshold
+    CV_MIN_DISTANCE: int = 7                 # Shi-Tomasi: min pixel spacing
+    CV_BLOCK_SIZE: int = 7                   # Shi-Tomasi: detection window
+    CV_LK_WIN_SIZE: int = 15                 # Lucas-Kanade: search window
+    CV_LK_MAX_LEVEL: int = 3                 # Lucas-Kanade: pyramid levels
+    CV_FB_THRESHOLD: float = 1.0             # forward-backward error threshold (px)
+    CV_FLOW_WEIGHT: float = 0.7              # weight for CV flow (vs 0.3 for ESP32)
 
     # ── Crash Safety ──────────────────────────────────────────────────
     CRASH_DISARM_ALT_M: float = 0.15         # force-disarm if below this alt

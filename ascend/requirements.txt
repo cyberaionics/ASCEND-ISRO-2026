@@ -4,3 +4,7 @@
 # ── Core Flight Stack ─────────────────────────────────────────────
 pymavlink>=2.4.41           # MAVLink protocol for Pixhawk communication
 pyserial>=3.5               # Serial UART for TF-02 LiDAR and ESP32-CAM
+
+# ── Computer Vision (RPi5 optical flow) ───────────────────────────
+opencv-python-headless>=4.8 # OpenCV without GUI (headless for RPi5)
+numpy>=1.24                 # Array operations for CV pipeline
