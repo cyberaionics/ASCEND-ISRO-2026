@@ -29,6 +29,8 @@ so VIOStabilizer can consume them without any other changes
 
 import threading
 import time
+import socket
+import concurrent.futures
 from typing import Optional
 
 import cv2
@@ -39,12 +41,94 @@ from ..logger import Logger
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  ESP32-CAM Auto-Discovery
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _tcp_probe(host: str, port: int, timeout: float = 0.3) -> bool:
+    """Return True if ``host:port`` accepts a TCP connection."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, socket.timeout):
+        return False
+
+
+def discover_esp32_cam() -> Optional[dict]:
+    """Auto-discover the ESP32-CAM on the network.
+
+    Strategy:
+      1. Try each candidate from ``Config.ESP32_WIFI_CANDIDATES`` (fast).
+      2. If none respond, scan configured subnets for port 81.
+      3. Return the first hit as ``{"stream": url, "still": url, ...}``,
+         or ``None`` if nothing found.
+    """
+    # ── Phase 1: candidate list (fast — 3 TCP probes) ─────────────
+    Logger.info("ESP32 discovery: trying candidate IPs …")
+    for cand in Config.ESP32_WIFI_CANDIDATES:
+        # Extract host from stream URL
+        host = cand["stream"].split("//")[1].split(":")[0]
+        port = Config.ESP32_WIFI_SCAN_PORT
+        if _tcp_probe(host, port, timeout=0.5):
+            Logger.ok(f"ESP32 found via candidate: {cand['label']}")
+            return cand
+        Logger.info(f"  {cand['label']} — no response")
+
+    # ── Phase 2: subnet scan (slower — parallel scan) ─────────────
+    Logger.warn(
+        "No candidate IP responded. Scanning subnets for ESP32-CAM "
+        f"(port {Config.ESP32_WIFI_SCAN_PORT}) …"
+    )
+    port = Config.ESP32_WIFI_SCAN_PORT
+    timeout = Config.ESP32_WIFI_SCAN_TIMEOUT
+
+    for subnet in Config.ESP32_WIFI_SCAN_SUBNETS:
+        Logger.info(f"  Scanning {subnet}.1-254 …")
+        hosts = [f"{subnet}.{i}" for i in range(1, 255)]
+
+        # Parallel scan — 50 workers for speed
+        with concurrent.futures.ThreadPoolExecutor(max_workers=50) as pool:
+            futures = {
+                pool.submit(_tcp_probe, h, port, timeout): h
+                for h in hosts
+            }
+            for future in concurrent.futures.as_completed(futures):
+                if future.result():
+                    found_host = futures[future]
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    Logger.ok(
+                        f"ESP32 found via scan: {found_host}:{port}"
+                    )
+                    return {
+                        "stream": f"http://{found_host}:{port}/stream",
+                        "still":  f"http://{found_host}:80/capture",
+                        "status": f"http://{found_host}:80/status",
+                        "label":  f"Scan-discovered ({found_host})",
+                    }
+
+    Logger.error(
+        "ESP32-CAM NOT FOUND on any network! Check:\n"
+        "  1. Is the ESP32-CAM powered on?\n"
+        "  2. Is the RPi WiFi hotspot running? Run:\n"
+        "     sudo nmcli device wifi hotspot ifname wlan0 "
+        "ssid ASCEND-AP password ascend123\n"
+        "  3. Or connect both RPi and ESP32 to the same WiFi.\n"
+        "  4. Phone hotspots often block device-to-device — "
+        "use RPi hotspot instead."
+    )
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Shared Frame Buffer — single MJPEG connection, multiple readers
 # ═══════════════════════════════════════════════════════════════════════════
 
 class WiFiFrameReader(threading.Thread):
     """Daemon thread that opens the ESP32-CAM MJPEG stream over WiFi
     and continuously stores the latest frame in a shared buffer.
+
+    On each connection attempt the reader runs ``discover_esp32_cam()``
+    to find the correct IP automatically.  This handles RPi hotspot,
+    phone hotspot, and ESP32 AP mode without manual IP changes.
 
     Only one instance should be created so only one HTTP connection
     is maintained to the ESP32-CAM (which has limited RAM / TCP sockets).
@@ -53,17 +137,19 @@ class WiFiFrameReader(threading.Thread):
     to retrieve the latest frame without opening their own connections.
 
     Args:
-        url: Full MJPEG stream URL, e.g. ``http://10.42.0.200:81/stream``.
+        url: Optional override URL. If provided, skip auto-discovery.
     """
 
     def __init__(self, url: str = "") -> None:
         super().__init__(daemon=True, name="WiFiFrameReader")
+        self._override_url = url if url else None
         self._url = url or Config.ESP32_WIFI_STREAM_URL
         self._lock = threading.Lock()
         self._running = threading.Event()
         self._running.set()
 
-        self._latest_frame: Optional[np.ndarray] = None
+        self._latest_frame: Optional[np.ndarray] = None       # greyscale
+        self._latest_color_frame: Optional[np.ndarray] = None  # BGR color
         self._frame_count: int = 0
         self._error_count: int = 0
         self._last_read_time: float = 0.0
@@ -91,40 +177,72 @@ class WiFiFrameReader(threading.Thread):
             return time.time() - self._last_read_time
 
     def get_frame(self) -> Optional[np.ndarray]:
-        """Return a copy of the latest valid frame, or ``None``."""
+        """Return a copy of the latest greyscale frame, or ``None``."""
         with self._lock:
             if self._latest_frame is not None:
                 return self._latest_frame.copy()
+            return None
+
+    def get_color_frame(self) -> Optional[np.ndarray]:
+        """Return a copy of the latest BGR colour frame, or ``None``."""
+        with self._lock:
+            if self._latest_color_frame is not None:
+                return self._latest_color_frame.copy()
             return None
 
     def stop(self) -> None:
         """Signal the reader thread to stop."""
         self._running.clear()
 
+    # ── Auto-Discover & Connect ────────────────────────────────────
+
+    def _resolve_url(self) -> str:
+        """Run auto-discovery unless a fixed URL was provided."""
+        if self._override_url:
+            return self._override_url
+
+        result = discover_esp32_cam()
+        if result is not None:
+            self._url = result["stream"]
+            return self._url
+
+        # Nothing found — fall through with the default URL
+        # so the reconnect loop keeps trying
+        Logger.warn(
+            f"Discovery failed — falling back to {self._url}"
+        )
+        return self._url
+
     # ── Thread Entry ───────────────────────────────────────────────
 
     def run(self) -> None:
         """Open the MJPEG stream and fill the shared frame buffer."""
-        Logger.info(f"WiFiFrameReader starting — URL: {self._url}")
+        Logger.info(f"WiFiFrameReader starting — auto-discovery enabled")
 
-        reconnect_delay = 2.0
+        reconnect_delay = 1.0  # fast reconnect on motor-arm brownout
 
         while self._running.is_set():
-            Logger.info(f"WiFiFrameReader connecting to {self._url} …")
-            cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
+            # Re-discover on every connect attempt (IP may change)
+            url = self._resolve_url()
+            Logger.info(f"WiFiFrameReader connecting to {url} …")
+
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            # Short read timeout so brownout is detected within 2s
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000)
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 6000)
 
             if not cap.isOpened():
                 Logger.warn(
-                    f"WiFiFrameReader: cannot open stream {self._url}. "
+                    f"WiFiFrameReader: cannot open stream {url}. "
                     f"Retry in {reconnect_delay:.0f}s. "
-                    "Check ESP32-CAM power and WiFi connection."
+                    "Will re-scan for ESP32-CAM."
                 )
                 time.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 1.5, 15.0)
+                reconnect_delay = min(reconnect_delay * 1.5, 5.0)
                 continue
 
-            Logger.ok("WiFiFrameReader: stream connected")
-            reconnect_delay = 2.0  # reset backoff on success
+            Logger.ok(f"WiFiFrameReader: stream connected — {url}")
+            reconnect_delay = 1.0  # reset backoff on success
 
             try:
                 while self._running.is_set():
@@ -132,14 +250,18 @@ class WiFiFrameReader(threading.Thread):
                     if not ret:
                         with self._lock:
                             self._error_count += 1
-                        Logger.warn("WiFiFrameReader: frame read failed — reconnecting")
-                        break  # outer loop will reconnect
+                        Logger.warn(
+                            "WiFiFrameReader: frame read failed — "
+                            "reconnecting (will re-discover)"
+                        )
+                        break  # outer loop will reconnect + re-discover
 
                     # Convert BGR to greyscale — all flow algorithms use grey
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
                     with self._lock:
                         self._latest_frame = gray
+                        self._latest_color_frame = frame  # keep BGR for WhiteDetector
                         self._frame_count += 1
                         self._last_read_time = time.time()
 
@@ -148,12 +270,109 @@ class WiFiFrameReader(threading.Thread):
             finally:
                 cap.release()
                 if self._running.is_set():
-                    Logger.info(
-                        f"WiFiFrameReader: reconnecting in {reconnect_delay:.0f}s"
+                    Logger.warn(
+                        f"WiFiFrameReader: reconnecting in "
+                        f"{reconnect_delay:.1f}s — will re-discover ESP32"
                     )
                     time.sleep(reconnect_delay)
 
         Logger.info("WiFiFrameReader stopped")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  White Board Detector — camera-based landing pad detection
+# ═══════════════════════════════════════════════════════════════════════════
+
+class WhiteDetector(threading.Thread):
+    """Checks what fraction of the camera frame is 'white'.
+
+    The drone sits on a white board.  As long as the camera sees mostly
+    white pixels underneath, the drone is over the board.  If the ratio
+    drops below ``Config.WHITE_MIN_RATIO``, the drone has drifted off.
+
+    Works in HSV space:
+      - White → low saturation (S < threshold) AND high value (V > threshold)
+      - The coloured foam mats are highly saturated → NOT white
+
+    Args:
+        frame_reader: Shared WiFiFrameReader (provides BGR colour frames).
+    """
+
+    def __init__(self, frame_reader: WiFiFrameReader) -> None:
+        super().__init__(daemon=True, name="WhiteDetector")
+        self._reader = frame_reader
+        self._running = threading.Event()
+        self._running.set()
+
+        self._lock = threading.Lock()
+        self._white_ratio: float = 1.0   # assume white until first frame
+        self._is_white: bool = True
+        self._last_time: float = 0.0
+        self._frame_idx: int = 0
+
+    # ── Public Interface ──────────────────────────────────────────────
+
+    @property
+    def is_over_white(self) -> bool:
+        """True if the camera currently sees mostly white below."""
+        with self._lock:
+            return self._is_white
+
+    @property
+    def white_ratio(self) -> float:
+        """Fraction of frame pixels classified as white (0..1)."""
+        with self._lock:
+            return self._white_ratio
+
+    @property
+    def data_age(self) -> float:
+        with self._lock:
+            if self._last_time == 0.0:
+                return float("inf")
+            return time.time() - self._last_time
+
+    def stop(self) -> None:
+        self._running.clear()
+
+    # ── Thread Entry ──────────────────────────────────────────────────
+
+    def run(self) -> None:
+        """Analyse frames at ~5 Hz."""
+        Logger.info("WhiteDetector started")
+        while self._running.is_set():
+            bgr = self._reader.get_color_frame()
+            if bgr is None:
+                time.sleep(0.2)
+                continue
+
+            try:
+                hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+                h, s, v = cv2.split(hsv)
+
+                # White pixel mask: low saturation AND high brightness
+                white_mask = (s < Config.WHITE_S_MAX) & (v > Config.WHITE_V_MIN)
+                ratio = float(np.count_nonzero(white_mask)) / white_mask.size
+
+                with self._lock:
+                    self._white_ratio = ratio
+                    self._is_white = ratio >= Config.WHITE_MIN_RATIO
+                    self._last_time = time.time()
+                    self._frame_idx += 1
+
+                # Log periodically
+                if self._frame_idx % 50 == 0:
+                    status = "✅ ON PAD" if self._is_white else "⚠ OFF PAD"
+                    Logger.info(
+                        f"WhiteDetector: ratio={ratio:.2f} "
+                        f"(min={Config.WHITE_MIN_RATIO}) {status}"
+                    )
+
+            except Exception as exc:
+                Logger.warn(f"WhiteDetector error: {exc}")
+
+            time.sleep(0.2)  # ~5 Hz
+
+        Logger.info("WhiteDetector stopped")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
