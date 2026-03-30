@@ -1,6 +1,21 @@
 """
-ASCEND Phase 1 — Configuration
+ASCEND — Configuration
 All system constants in one place. No magic numbers anywhere else.
+Hardware: Pixhawk 2.4.8 (ArduCopter), RPi4, TF-02 LiDAR, ESP32-CAM (OV2640).
+
+WiFi Architecture (replaces UART):
+  ESP32-CAM → WiFi MJPEG stream → RPi4 OpenCV optical flow
+  ESP32 operates in STA mode, joining the RPi4's WiFi hotspot.
+
+  To create the RPi4 hotspot:
+    sudo nmcli device wifi hotspot ifname wlan0 ssid ASCEND-AP password ascend123
+  The ESP32-CAM connects and gets static IP 10.42.0.200 (set in .ino).
+  Stream URL: http://10.42.0.200:81/stream
+
+  If the ESP32 is in AP mode instead (fallback):
+    Connect RPi4 to "ASCEND-CAM" network.
+    Stream URL: http://192.168.4.1:81/stream
+    Update ESP32_WIFI_STREAM_URL below accordingly.
 """
 
 
@@ -8,13 +23,13 @@ class Config:
     """Centralised configuration for the ASCEND drone system.
 
     Every tunable constant — serial ports, baud rates, timing values,
-    thresholds, Pixhawk parameters, geofence limits — lives here so
-    nothing is hard-coded elsewhere in the codebase.
+    thresholds, PID gains, Pixhawk parameters — lives here so nothing
+    is hard-coded elsewhere in the codebase.
     """
 
     # ── Serial Ports ───────────────────────────────────────────────────
     PIXHAWK_PORT: str = "/dev/ttyACM0"
-    PIXHAWK_BAUD: int = 921600
+    PIXHAWK_BAUD: int = 115200
 
     TF02_PORT: str = "/dev/serial0"
     TF02_BAUD: int = 115200
@@ -25,40 +40,136 @@ class Config:
     TF02_MIN_CM: int = 30
     TF02_MAX_CM: int = 800
 
+    # ── ESP32-CAM WiFi Stream ──────────────────────────────────────────
+    # The ESP32-CAM streams MJPEG over WiFi instead of UART.
+    # STA mode (recommended): ESP32 joins RPi hotspot at static IP.
+    # AP mode (fallback):     ESP32 creates hotspot; use 192.168.4.1.
+    #
+    # Update this URL to match your ESP32-CAM's actual IP address.
+    ESP32_WIFI_STREAM_URL: str = "http://10.27.96.207:81/stream"
+    ESP32_WIFI_STILL_URL:  str = "http://10.27.96.207:80/capture"
+    ESP32_WIFI_STATUS_URL: str = "http://10.27.96.207:80/status"
+
+    # How long to wait for the first WiFi frame before warning
+    ESP32_WIFI_CONNECT_TIMEOUT: float = 15.0
+
+    # ── ESP32-CAM UART (LEGACY — no longer used, kept for reference) ───
+    # These ports are now free for other peripherals.
+    # ESP32_CAM_PORT: str = "/dev/ttyAMA2"   # was UART0 flow packets
+    # ESP32_CAM_BAUD: int = 115200
+    # ESP32_FRAME_PORT: str = "/dev/ttyAMA3" # was UART2 raw frames
+    # ESP32_FRAME_BAUD: int = 921600
+
+    # ── VIO Stabilization (common) ────────────────────────────────────
+    VIO_RATE_HZ: int = 20
+    VIO_INTERVAL: float = 1.0 / 20
+    VIO_DEADZONE_PX: int = 2
+    VIO_MIN_QUALITY: int = 5
+    VIO_MAX_CORRECTION_PWM: int = 100
+    VIO_FOCAL_LENGTH_PX: float = 200.0   # OV2640 @ QVGA 320×240 (scaled from QQVGA)
+    VIO_DATA_TIMEOUT: float = 0.5
+    VIO_MIN_ALT_M: float = 0.3
+    VIO_INTEGRAL_MAX: float = 50.0       # anti-windup clamp (PWM)
+
+    # ── LK Pipeline PID (was ESP32 UART pipeline) ────────────────────
+    # Now drives WiFiLKProcessor output (actual pixels, not ×100).
+    ESP_VIO_KP: float = 0.4
+    ESP_VIO_KI: float = 0.05
+    ESP_VIO_KD: float = 0.02
+    ESP_VIO_WEIGHT: float = 0.4
+
+    # ── ORB Pipeline PID (WiFiORBProcessor) ──────────────────────────
+    ORB_VIO_KP: float = 0.5
+    ORB_VIO_KI: float = 0.08
+    ORB_VIO_KD: float = 0.03
+    ORB_VIO_WEIGHT: float = 0.6
+
+    # ── Legacy single-source VIO (kept for cv_flow.py compat) ─────────
+    VIO_KP: float = 0.5
+    VIO_KI: float = 0.15
+    VIO_KD: float = 0.3
+    VIO_EMA_ALPHA: float = 0.4
+
+    # ── VIO Position Hold (kept for backward compat) ──────────────────
+    VIO_POS_KP: float = 0.8
+    VIO_POS_MAX_M: float = 3.0
+    VIO_POS_DECAY: float = 0.998
+
+    # ── OpenCV Optical Flow (shared by LK and CVFlowProcessor) ────────
+    # WiFiLKProcessor and CVFlowProcessor both use these parameters.
+    CV_CAMERA_ID: int = 0
+    CV_FRAME_WIDTH: int = 320    # QVGA — must match CAM_FRAMESIZE in .ino
+    CV_FRAME_HEIGHT: int = 240   # QVGA — must match CAM_FRAMESIZE in .ino
+    CV_FPS: int = 15             # QVGA runs ~15fps over WiFi
+    CV_MAX_CORNERS: int = 150    # more corners for bigger frame
+    CV_QUALITY_LEVEL: float = 0.05
+    CV_MIN_DISTANCE: int = 10    # scaled up for larger frame
+    CV_BLOCK_SIZE: int = 7
+    CV_LK_WIN_SIZE: int = 21     # larger window for QVGA
+    CV_LK_MAX_LEVEL: int = 3
+    CV_FB_THRESHOLD: float = 1.0
+    CV_FLOW_WEIGHT: float = 0.7
+
+    # ── ORB Feature Detector ──────────────────────────────────────────
+    ORB_N_FEATURES: int = 200
+    ORB_RANSAC_THRESH: float = 5.0
+    ORB_MIN_MATCHES: int = 8
+
+    # ── Crash Safety ──────────────────────────────────────────────────
+    CRASH_DISARM_ALT_M: float = 0.15
+    CRASH_DISARM_TIMEOUT: float = 3.0
+
     # ── MAVLink System IDs ─────────────────────────────────────────────
-    SYSTEM_ID: int = 1           # Pixhawk system ID
-    COMPANION_SYSID: int = 255   # RPi5 companion computer
-    COMPANION_COMPID: int = 190  # MAV_COMP_ID_ONBOARD_COMPUTER4
+    SYSTEM_ID: int = 1
+    COMPANION_SYSID: int = 255
+    COMPANION_COMPID: int = 190
 
     # ── Timing (seconds) ──────────────────────────────────────────────
     HEARTBEAT_INTERVAL: float = 1.0
+    HEARTBEAT_HZ: int = 1
     TELEMETRY_INTERVAL: float = 1.0
-    BRIDGE_HZ: int = 20                    # rangefinder bridge rate
-    BRIDGE_INTERVAL: float = 1.0 / BRIDGE_HZ
-    TX_POLL_INTERVAL: float = 0.1          # RC override check (100 ms)
-    MAIN_LOOP_INTERVAL: float = 0.05       # 20 Hz state-machine tick
-    CONNECT_TIMEOUT: float = 30.0          # wait for Pixhawk heartbeat
-    PARAM_TIMEOUT: float = 5.0             # param read/write ACK timeout
-    PREFLIGHT_TIMEOUT: float = 30.0        # arming attempt window
+    BRIDGE_HZ: int = 20
+    BRIDGE_INTERVAL: float = 1.0 / 20
+    TX_POLL_INTERVAL: float = 0.1
+    MAIN_LOOP_INTERVAL: float = 0.05
+    CONNECT_TIMEOUT: float = 30.0
+    PARAM_TIMEOUT: float = 5.0
+    PREFLIGHT_TIMEOUT: float = 30.0
 
     # ── Flight Parameters ──────────────────────────────────────────────
-    TARGET_ALT_M: float = 4.0              # hover altitude (metres)
-    ALT_TOLERANCE_M: float = 0.2           # ±0.2 m considered "at altitude"
-    ALT_STABLE_TIME: float = 2.0           # stable for 2 s → transition
-    HOVER_DURATION: float = 300.0          # 5 minutes
-    TOUCHDOWN_ALT_M: float = 0.10          # TF-02 reading below this = ground
-    TOUCHDOWN_TIME: float = 1.0            # must be below for 1 s
-    HOME_RADIUS_M: float = 1.5             # RTL → LAND radius
+    TARGET_ALT_M: float = 1.0
+    HOVER_TARGET_ALT_M: float = 1.0
+    ALT_TOLERANCE_M: float = 0.2
+    ALT_STABLE_TIME: float = 2.0
+    HOVER_DURATION: float = 30.0        # 30s for first tests — increase after tuning
+    HOVER_DURATION_S: float = 30.0      # 30s for first tests — increase after tuning
+    HOVER_KP_ALT: float = 200.0        # PWM per metre error
+    BASE_THROTTLE_PWM: int = 1550
+    MIN_THROTTLE_PWM: int = 1100
+    MAX_THROTTLE_PWM: int = 1800
+    TAKEOFF_START_PWM: int = 1400
+    TAKEOFF_RAMP_PWM_PER_S: int = 50
+    TAKEOFF_TIMEOUT_S: float = 30.0
+    TAKEOFF_ALT_THRESHOLD: float = 0.70
+    LAND_DURATION_S: float = 8.0
+    LAND_THROTTLE_DROP_PER_S: int = 50
+    ARM_TIMEOUT_S: float = 10.0
+    DISARM_TIMEOUT_S: float = 5.0
+    TOUCHDOWN_ALT_M: float = 0.10
+    TOUCHDOWN_TIME: float = 1.0
+    HOME_RADIUS_M: float = 1.5
 
     # ── Geofence ───────────────────────────────────────────────────────
     FENCE_X_M: float = 15.0
     FENCE_Y_M: float = 15.0
 
     # ── Safety Thresholds ──────────────────────────────────────────────
-    TF02_DATA_TIMEOUT: float = 2.0         # no reading → emergency
-    WIFI_HB_TIMEOUT: float = 3.0           # no laptop heartbeat → emergency
-    LOW_BATTERY_VOLT: float = 14.0         # 3.5 V / cell
-    CRITICAL_BATTERY_VOLT: float = 13.2    # 3.3 V / cell
+    TF02_DATA_TIMEOUT: float = 2.0
+    WIFI_HB_TIMEOUT: float = 3.0
+    LOW_BATTERY_VOLT: float = 14.0
+    CRITICAL_BATTERY_VOLT: float = 13.2
+    BATT_LOW_VOLT: float = 14.0
+    BATT_CRITICAL_VOLT: float = 13.2
 
     # ── Vibration Thresholds (m/s²) ────────────────────────────────────
     VIB_EXCELLENT: float = 15.0
@@ -69,9 +180,11 @@ class Config:
     RC_PWM_MIN: int = 1000
     RC_PWM_MAX: int = 2000
     RC_INVALID_VALS: tuple = (0, 65535)
+    RC8_OPTION: int = 8
 
     # ── Telemetry Streaming ────────────────────────────────────────────
-    LAPTOP_IP: str = "192.168.4.1"         # laptop hotspot gateway
+    TELEMETRY_HOST: str = "0.0.0.0"
+    LAPTOP_IP: str = "255.255.255.255"
     TELEMETRY_PORT: int = 14550
 
     # ── Health-Check Durations (seconds) ───────────────────────────────
@@ -135,12 +248,18 @@ class Config:
     }
 
     # ── ArduCopter Flight-Mode Numbers ─────────────────────────────────
-    MODE_MAP: dict = {
-        "STABILIZE":  0,
-        "ALT_HOLD":   2,
-        "LOITER":     5,
-        "RTL":        6,
-        "LAND":       9,
-        "GUIDED":    15,
-        "AUTOTUNE":  22,
+    MODE_MAP = {
+        "STABILIZE":    0,
+        "ACRO":         1,
+        "ALT_HOLD":     2,
+        "AUTO":         3,
+        "GUIDED":       4,
+        "LOITER":       5,
+        "RTL":          6,
+        "CIRCLE":       7,
+        "LAND":         9,
+        "DRIFT":        11,
+        "SPORT":        13,
+        "GUIDED_NOGPS": 20,
+        "AUTOTUNE":     17,
     }
