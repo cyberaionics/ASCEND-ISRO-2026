@@ -87,6 +87,7 @@ class MissionController:
         self._integral_x: float = 0.0
         self._integral_y: float = 0.0
         self._last_pi_time: float = 0.0
+        self._ground_touch_start: Optional[float] = None
 
         # ── Position tracking from LOCAL_POSITION_NED ─────────────────
         self._local_pos_x: float = 0.0
@@ -353,6 +354,27 @@ class MissionController:
         velocity correction at 20 Hz (main loop rate).
         """
         now = time.time()
+        alt_m = self._tf02.distance_m
+        min_hover_alt = abs(Config.HOVER_TARGET_Z) * 0.95
+
+        # Start PI loop only after reaching 95% of target hover altitude.
+        if alt_m is None or alt_m < min_hover_alt:
+            self._px.send_position_target_local_ned_full(
+                x=Config.HOVER_TARGET_X,
+                y=Config.HOVER_TARGET_Y,
+                z=Config.HOVER_TARGET_Z,
+                vx=0.0,
+                vy=0.0,
+                vz=0.0,
+            )
+            if now - self._last_log >= 1.0:
+                self._last_log = now
+                alt_str = f"{alt_m:.2f}m" if alt_m is not None else "---"
+                Logger.info(
+                    f"HOVER  | waiting altitude lock | alt={alt_str} "
+                    f"(need >= {min_hover_alt:.2f}m)"
+                )
+            return
 
         # Initialize hover timer
         if self._hover_start is None:
@@ -392,6 +414,9 @@ class MissionController:
         # PI output → velocity command
         cmd_vx = Config.POS_HOLD_KP * err_x + Config.POS_HOLD_KI * self._integral_x
         cmd_vy = Config.POS_HOLD_KP * err_y + Config.POS_HOLD_KI * self._integral_y
+        max_v = Config.POS_HOLD_MAX_VEL_MPS
+        cmd_vx = max(-max_v, min(max_v, cmd_vx))
+        cmd_vy = max(-max_v, min(max_v, cmd_vy))
 
         # ── Send position + velocity target ───────────────────────────
         self._px.send_position_target_local_ned_full(
@@ -406,7 +431,6 @@ class MissionController:
         # ── Diagnostics every second ──────────────────────────────────
         if now - self._last_log >= 1.0:
             self._last_log = now
-            alt_m = self._tf02.distance_m
             alt_str = f"{alt_m:.2f}m" if alt_m is not None else "---"
             drift = (pos_x ** 2 + pos_y ** 2) ** 0.5
             Logger.info(
@@ -451,12 +475,24 @@ class MissionController:
             self._last_log = now
             Logger.info(f"LAND   | t={elapsed:.1f}s | alt={alt_str}")
 
-        # Touchdown detection
-        if alt_m is not None and alt_m < Config.TOUCHDOWN_ALT_M:
-            if elapsed > 2.0:  # wait at least 2s to avoid false detection
-                Logger.ok(f"Touchdown at {alt_m:.2f}m — disarming")
+        # Ground touch check: lidar < 0.1m for >1.0s forces DISARM.
+        if alt_m is not None and alt_m < 0.1:
+            if self._ground_touch_start is None:
+                self._ground_touch_start = now
+            elif now - self._ground_touch_start > 1.0:
+                Logger.ok(f"Ground touch confirmed ({alt_m:.2f}m >1s) — disarming")
                 self._px.disarm()
                 self._transition(MissionState.DONE)
+                return
+        else:
+            self._ground_touch_start = None
+
+        # Fallback touchdown detection
+        if alt_m is not None and alt_m < Config.TOUCHDOWN_ALT_M and elapsed > 2.0:
+            Logger.ok(f"Touchdown at {alt_m:.2f}m — disarming")
+            self._px.disarm()
+            self._transition(MissionState.DONE)
+            return
         elif elapsed > Config.LAND_DURATION_S + 5.0:
             Logger.warn("Land timeout — force disarm")
             self._px.disarm()

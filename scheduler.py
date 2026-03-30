@@ -191,6 +191,7 @@ class Scheduler:
         # ── 7. HeartbeatSender + RangefinderBridge ────────────────────
         self._start_heartbeat()
         self._start_bridge()
+        self._start_telemetry_bridge()
 
         # ── 8. MissionController (blocking state machine) ─────────────
         Logger.header("LAUNCHING MISSION CONTROLLER")
@@ -289,6 +290,12 @@ class Scheduler:
         hb = HeartbeatSender(self._pixhawk)
         hb.start()
         self._threads.append(hb)
+
+    def _start_telemetry_bridge(self) -> None:
+        """Start raw MAVLink passthrough to laptop UDP (Mission Planner)."""
+        bridge = TelemetryStreamer(self._pixhawk)
+        bridge.start()
+        self._threads.append(bridge)
 
     def _start_wifi_cam(self) -> None:
         """Start WiFi frame reader + LK + ORB processors.

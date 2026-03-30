@@ -3,17 +3,15 @@ ASCEND Phase 1 — Daemon Thread Workers
 Provides five background daemons that run alongside the main state machine:
   • RangefinderBridge   — TF-02 → Pixhawk at 20 Hz
   • HeartbeatSender     — companion heartbeat at 1 Hz
-  • TelemetryStreamer   — JSON telemetry to laptop over UDP at 1 Hz
+  • TelemetryStreamer   — raw MAVLink pass-through to laptop UDP
   • SafetyMonitor       — continuous fault detection
   • SensorFusionBridge  — ESP32-CAM + TF-02 → ODOMETRY at 20 Hz (EKF3 fusion)
 """
 
-import datetime
-import json
 import socket
 import threading
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from ..config import Config
 from ..logger import Logger
@@ -102,48 +100,49 @@ class HeartbeatSender(threading.Thread):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TelemetryStreamer(threading.Thread):
-    """Streams live telemetry as JSON over UDP to the laptop at 1 Hz.
+    """Transparent MAVLink bridge: Pixhawk USB RX → laptop UDP:14550.
 
-    The laptop runs as a Wi-Fi hotspot; RPi5 is a client. Telemetry
-    is sent as one JSON packet per second on the configured UDP port.
-
-    Args:
-        state_getter: Callable returning a dict with all current telemetry
-                      fields (populated by the state machine or scheduler).
+    This enables Mission Planner telemetry over Wi-Fi while Python code
+    continues controlling the same flight controller over USB.
     """
 
-    def __init__(self, state_getter: Callable[[], dict]) -> None:
+    def __init__(self, pixhawk: PixhawkLink) -> None:
         super().__init__(daemon=True, name="TelemetryStreamer")
-        self._get_state = state_getter
+        self._pixhawk = pixhawk
         self._running = threading.Event()
         self._running.set()
         self._sock: Optional[socket.socket] = None
+        self._dest = (Config.LAPTOP_IP, Config.TELEMETRY_PORT)
+
+    def _forward_packet(self, packet: bytes) -> None:
+        """Forward one raw MAVLink packet to laptop UDP endpoint."""
+        if not packet or self._sock is None:
+            return
+        try:
+            self._sock.sendto(packet, self._dest)
+        except Exception:
+            # Packet loss on Wi-Fi is acceptable for telemetry.
+            pass
 
     def stop(self) -> None:
         """Signal the streamer thread to stop."""
         self._running.clear()
 
     def run(self) -> None:
-        """Open a UDP socket and stream telemetry."""
+        """Open UDP socket and relay all inbound MAVLink packets."""
         Logger.info(f"TelemetryStreamer → {Config.LAPTOP_IP}:{Config.TELEMETRY_PORT}")
         try:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         except OSError as exc:
             Logger.error(f"TelemetryStreamer cannot create socket: {exc}")
             return
 
-        dest = (Config.LAPTOP_IP, Config.TELEMETRY_PORT)
+        self._pixhawk.add_rx_listener(self._forward_packet)
         while self._running.is_set():
-            try:
-                state = self._get_state()
-                state["timestamp"] = datetime.datetime.now().isoformat()
-                packet = json.dumps(state).encode("utf-8")
-                self._sock.sendto(packet, dest)
-            except Exception:
-                # Laptop may not be reachable — silently continue
-                pass
-            time.sleep(Config.TELEMETRY_INTERVAL)
+            time.sleep(0.1)
 
+        self._pixhawk.remove_rx_listener(self._forward_packet)
         self._sock.close()
         Logger.info("TelemetryStreamer stopped")
 
@@ -188,6 +187,7 @@ class SafetyMonitor(threading.Thread):
 
         # Flight-active flag — safety checks only run when armed & flying
         self._flight_active: bool = False
+        self._hard_kill_sent: bool = False
 
     # ── Public Properties ──────────────────────────────────────────────
 
@@ -233,6 +233,7 @@ class SafetyMonitor(threading.Thread):
         with self._lock:
             self._emergency_flag = False
             self._emergency_reason = ""
+            self._hard_kill_sent = False
 
     def stop(self) -> None:
         """Signal the monitor thread to stop."""
@@ -253,6 +254,7 @@ class SafetyMonitor(threading.Thread):
     def run(self) -> None:
         """Poll safety conditions at 10 Hz."""
         Logger.info("SafetyMonitor running")
+        interval = 1.0 / max(1, Config.SAFETY_MONITOR_HZ)
         while self._running.is_set():
             with self._lock:
                 flight_active = self._flight_active
@@ -260,9 +262,10 @@ class SafetyMonitor(threading.Thread):
             if flight_active:
                 self._check_tf02()
                 self._check_wifi()
+                self._check_drift_kill()
                 self._check_geofence()
 
-            time.sleep(0.1)
+            time.sleep(interval)
         Logger.info("SafetyMonitor stopped")
 
     def _check_tf02(self) -> None:
@@ -285,6 +288,27 @@ class SafetyMonitor(threading.Thread):
         if abs(x) > Config.FENCE_X_M or abs(y) > Config.FENCE_Y_M:
             self._trigger(f"Geofence breach — pos=({x:.1f}, {y:.1f}) "
                           f"limits=±({Config.FENCE_X_M}, {Config.FENCE_Y_M})")
+
+    def _check_drift_kill(self) -> None:
+        """Hard-kill if drift exceeds strict indoor limit."""
+        with self._lock:
+            x, y = self._pos_x, self._pos_y
+            already_sent = self._hard_kill_sent
+
+        if already_sent:
+            return
+
+        if abs(x) > Config.DRIFT_KILL_M or abs(y) > Config.DRIFT_KILL_M:
+            self._trigger(
+                f"Drift kill breach — pos=({x:.2f}, {y:.2f}) "
+                f"limit=±{Config.DRIFT_KILL_M:.2f}m"
+            )
+            Logger.error("⚠ HARD-KILL: Forcing LAND + DISARM")
+            self._pixhawk.set_mode("LAND")
+            time.sleep(0.15)
+            self._pixhawk.disarm()
+            with self._lock:
+                self._hard_kill_sent = True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -387,15 +411,12 @@ class SensorFusionBridge(threading.Thread):
         lon = Config.EKF_ORIGIN_LON
         alt = Config.EKF_ORIGIN_ALT
 
-        Logger.info("EKF_INIT: Sending GPS origin + home position …")
-        self._pixhawk.send_gps_global_origin(lat, lon, alt)
-        time.sleep(0.1)  # small gap to ensure ordering
-        self._pixhawk.send_home_position(lat, lon, alt)
-        time.sleep(0.1)
-        # Send a second time for reliability (some FC firmware needs it)
-        self._pixhawk.send_gps_global_origin(lat, lon, alt)
-        time.sleep(0.1)
-        self._pixhawk.send_home_position(lat, lon, alt)
+        Logger.info("EKF_INIT: Sending GPS origin + home position handshake …")
+        for _ in range(5):
+            self._pixhawk.send_gps_global_origin(lat, lon, alt)
+            time.sleep(0.2)
+            self._pixhawk.send_home_position(lat, lon, alt)
+            time.sleep(0.2)
         Logger.ok("EKF_INIT: GPS origin and home position set at (0, 0, 0) — "
                    "EKF3 alignment should begin")
 
@@ -417,9 +438,12 @@ class SensorFusionBridge(threading.Thread):
         if quality < 1 or alt_m is None or alt_m < Config.VIO_MIN_ALT_M:
             # Keep sending last-known data — don't zero out
             if self._prev_time > 0:
+                with self._lock:
+                    px, py = self._pos_x, self._pos_y
+                    fvx, fvy = self._filtered_vx, self._filtered_vy
                 self._pixhawk.send_odometry(
-                    x=self._pos_x, y=self._pos_y, z=-alt_m if alt_m else 0.0,
-                    vx=self._filtered_vx, vy=self._filtered_vy, vz=0.0,
+                    x=px, y=py, z=-alt_m if alt_m is not None else 0.0,
+                    vx=fvx, vy=fvy, vz=0.0,
                 )
             return
 
@@ -485,6 +509,7 @@ class SensorFusionBridge(threading.Thread):
             f"estimator=VISION({Config.ODOMETRY_ESTIMATOR_TYPE})"
         )
 
+        next_tick = time.perf_counter()
         while self._running.is_set():
             try:
                 self._fusion_step()
@@ -503,7 +528,12 @@ class SensorFusionBridge(threading.Thread):
                         f"alt={self._tf02.distance_m or 0:.2f}m"
                     )
 
-            time.sleep(Config.FUSION_INTERVAL)
+            next_tick += Config.FUSION_INTERVAL
+            sleep_s = next_tick - time.perf_counter()
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            else:
+                next_tick = time.perf_counter()
 
         Logger.info("SensorFusionBridge stopped")
 

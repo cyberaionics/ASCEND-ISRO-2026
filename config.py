@@ -191,9 +191,9 @@ class Config:
     TAKEOFF_START_PWM: int = 1100
     TAKEOFF_HOVER_PWM: int = 1500
     TAKEOFF_MAX_PWM: int = 1650        # lowered from 1850 — prevent hitting net
-    TAKEOFF_RAMP_PWM_STEP: int = 2     # SUPER SLOW: was 5, now 2 PWM per step
-    TAKEOFF_RAMP_INTERVAL: float = 0.15 # slower: was 0.1, now 0.15s per step
-    TAKEOFF_RAMP_PWM_PER_S: int = 13   # effective: 2/0.15 ≈ 13 PWM/s (was 50)
+    TAKEOFF_RAMP_PWM_STEP: int = 1      # extra-gentle ramp to avoid sudden lift jumps
+    TAKEOFF_RAMP_INTERVAL: float = 0.15 # keep slower interval
+    TAKEOFF_RAMP_PWM_PER_S: int = 7     # effective: 1/0.15 ≈ 6.7 PWM/s
     TAKEOFF_TIMEOUT_S: float = 60.0    # longer timeout since ramp is slower
     TAKEOFF_ALT_THRESHOLD: float = 0.70
     LAND_DURATION_S: float = 8.0
@@ -221,8 +221,9 @@ class Config:
     # ── VIO Drift Kill (emergency motor kill if drone drifts off board) ─
     # If accumulated X-Y displacement exceeds this, IMMEDIATE DISARM.
     # The white board is small — drone must not drift beyond it.
-    DRIFT_KILL_M: float = 1.0          # max allowed drift from takeoff position
+    DRIFT_KILL_M: float = 0.35         # strict indoor drift kill radius
     DRIFT_KILL_ENABLED: bool = True
+    DRIFT_KILL_SPEED_MPS: float = 0.60  # hard-kill if lateral speed spikes
 
     # ── White Board Detection (camera-based landing pad check) ────────
     # If <WHITE_MIN_RATIO of pixels are "white", drone is off the pad → LAND.
@@ -236,14 +237,14 @@ class Config:
     # ── GUIDED_NOGPS Flight Parameters ────────────────────────────────
     # All thrust values are normalised (0.0 – 1.0).
     # Angles are in radians.
-    GUIDED_BASE_THRUST: float = 0.45       # hover thrust (tune to your airframe)
+    GUIDED_BASE_THRUST: float = 0.48       # hover thrust (tune to your airframe)
     GUIDED_MAX_THRUST: float = 0.65        # absolute max thrust (safety cap)
     GUIDED_MIN_THRUST: float = 0.0         # minimum thrust
     GUIDED_TAKEOFF_START_THRUST: float = 0.20  # starting thrust for ramp
     GUIDED_TAKEOFF_MAX_THRUST: float = 0.55    # max thrust during takeoff ramp
-    GUIDED_TAKEOFF_RAMP_STEP: float = 0.005    # thrust increment per step
-    GUIDED_HOVER_KP_ALT: float = 0.15     # thrust per metre altitude error
-    GUIDED_MAX_TILT_RAD: float = 0.087     # max roll/pitch (~5°, indoor-safe)
+    GUIDED_TAKEOFF_RAMP_STEP: float = 0.0025   # slower thrust ramp per step
+    GUIDED_HOVER_KP_ALT: float = 0.2      # thrust per metre altitude error
+    GUIDED_MAX_TILT_RAD: float = 0.052     # max roll/pitch (~3°, safer indoors)
     GUIDED_LAND_DESCENT_RATE: float = 0.3  # m/s descent during landing
     GUIDED_YAW_RAD: float = 0.0            # default yaw (0 = current heading)
 
@@ -266,7 +267,7 @@ class Config:
     # ── Sensor Fusion Engine ───────────────────────────────────────────
     FUSION_RATE_HZ: int = 20
     FUSION_INTERVAL: float = 1.0 / 20       # 50 ms
-    LPF_ALPHA: float = 0.2                  # low-pass filter coefficient
+    LPF_ALPHA: float = 0.3                  # low-pass filter coefficient
     ODOMETRY_ESTIMATOR_TYPE: int = 6        # MAV_ESTIMATOR_TYPE_VISION
 
     # ── EKF3 Origin (fake GPS origin for indoor flight) ───────────────
@@ -276,9 +277,10 @@ class Config:
     EKF_INIT_TIMEOUT: float = 30.0          # max wait for EKF convergence
 
     # ── Position Hold PID (Python-side drift monitor) ─────────────────
-    POS_HOLD_KP: float = 0.5
-    POS_HOLD_KI: float = 0.01
-    POS_HOLD_INTEGRAL_MAX: float = 2.0      # anti-windup clamp (m/s)
+    POS_HOLD_KP: float = 0.65
+    POS_HOLD_KI: float = 0.015
+    POS_HOLD_INTEGRAL_MAX: float = 1.0      # anti-windup clamp (m/s)
+    POS_HOLD_MAX_VEL_MPS: float = 0.25      # clamp XY correction speed
     HOVER_TARGET_X: float = 0.0             # NED X target (m)
     HOVER_TARGET_Y: float = 0.0             # NED Y target (m)
     HOVER_TARGET_Z: float = -1.0            # NED Z target (m) — negative = up
@@ -288,7 +290,7 @@ class Config:
     SAFETY_MONITOR_HZ: int = 20             # safety check rate
 
     # ── Safety Thresholds ──────────────────────────────────────────────
-    TF02_DATA_TIMEOUT: float = 2.0
+    TF02_DATA_TIMEOUT: float = 0.5
     WIFI_HB_TIMEOUT: float = 3.0
     LOW_BATTERY_VOLT: float = 14.0
     CRITICAL_BATTERY_VOLT: float = 13.2

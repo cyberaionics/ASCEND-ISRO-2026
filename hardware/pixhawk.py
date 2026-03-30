@@ -6,7 +6,7 @@ Thread-safe pymavlink wrapper for all flight-controller communication.
 import math
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Callable, List, Optional
 
 from pymavlink import mavutil
 
@@ -35,6 +35,8 @@ class PixhawkLink:
     def __init__(self) -> None:
         self._conn: Optional[Any] = None
         self._send_lock = threading.Lock()
+        self._rx_lock = threading.Lock()
+        self._rx_listeners: List[Callable[[bytes], None]] = []
         self._connected = False
 
     # ── Connection ─────────────────────────────────────────────────────
@@ -83,6 +85,39 @@ class PixhawkLink:
             self._conn.close()
             self._connected = False
             Logger.info("Pixhawk connection closed")
+
+    # ── RX Tap (for telemetry bridge) ───────────────────────────────────
+
+    def add_rx_listener(self, listener: Callable[[bytes], None]) -> None:
+        """Register a callback that receives raw incoming MAVLink packets."""
+        with self._rx_lock:
+            if listener not in self._rx_listeners:
+                self._rx_listeners.append(listener)
+
+    def remove_rx_listener(self, listener: Callable[[bytes], None]) -> None:
+        """Unregister a previously added incoming MAVLink packet listener."""
+        with self._rx_lock:
+            if listener in self._rx_listeners:
+                self._rx_listeners.remove(listener)
+
+    def _notify_rx_listeners(self, msg: Any) -> None:
+        """Fan out one received MAVLink packet to all listeners."""
+        if msg is None:
+            return
+        try:
+            raw = msg.get_msgbuf()
+        except Exception:
+            raw = None
+        if not raw:
+            return
+        with self._rx_lock:
+            listeners = list(self._rx_listeners)
+        for listener in listeners:
+            try:
+                listener(raw)
+            except Exception:
+                # Never allow external listeners to break receive path.
+                pass
 
     # ── Heartbeat ──────────────────────────────────────────────────────
 
@@ -397,6 +432,7 @@ class PixhawkLink:
         try:
             msg = self._conn.recv_match(type=msg_type, blocking=True,
                                          timeout=timeout)
+            self._notify_rx_listeners(msg)
             return msg
         except Exception:
             return None
@@ -414,6 +450,7 @@ class PixhawkLink:
             return None
         try:
             msg = self._conn.recv_match(blocking=True, timeout=timeout)
+            self._notify_rx_listeners(msg)
             return msg
         except Exception:
             return None

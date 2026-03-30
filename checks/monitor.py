@@ -145,6 +145,23 @@ class FlightSafetyMonitor(threading.Thread):
             except Exception:
                 Logger.error("LAND mode also failed — critical failure")
 
+    def _trigger_land_disarm(self, reason: str) -> None:
+        """Emergency hard-stop for floor-running prevention."""
+        with self._lock:
+            if self._triggered:
+                return
+            self._triggered = True
+            self._emergency_flag = True
+            self._emergency_reason = reason
+
+        Logger.error(f"⚠ SAFETY HARD-KILL: {reason}")
+        try:
+            self._px.set_mode("LAND")
+            time.sleep(0.15)
+            self._px.disarm()
+        except Exception as exc:
+            Logger.error(f"HARD-KILL command failed: {exc}")
+
     # ── Health Checks ──────────────────────────────────────────────────
 
     def _check_esp32_heartbeat(self) -> None:
@@ -169,16 +186,41 @@ class FlightSafetyMonitor(threading.Thread):
     def _check_lidar_heartbeat(self) -> None:
         """Check TF-02 LiDAR data age.
 
-        Triggers BRAKE if data_age > 250 ms.
+        Triggers LAND+DISARM if data_age exceeds TF02_DATA_TIMEOUT.
         """
         data_age = self._tf02.data_age
         if data_age == float("inf"):
             return  # not yet initialized
 
-        if data_age > Config.STREAM_LATENCY_MAX_S:
-            self._trigger_brake(
+        if data_age > Config.TF02_DATA_TIMEOUT:
+            self._trigger_land_disarm(
                 f"TF-02 LiDAR stale — data_age={data_age*1000:.0f}ms "
-                f"> {Config.STREAM_LATENCY_MAX_S*1000:.0f}ms limit"
+                f"> {Config.TF02_DATA_TIMEOUT*1000:.0f}ms limit"
+            )
+
+    def _check_drift_kill(self) -> None:
+        """Kill mission if integrated XY drift exceeds strict threshold."""
+        if self._fusion is None:
+            return
+        try:
+            pos_x, pos_y = self._fusion.position
+            vel_x = self._fusion.filtered_vx
+            vel_y = self._fusion.filtered_vy
+        except Exception:
+            return
+        lateral_speed = (vel_x * vel_x + vel_y * vel_y) ** 0.5
+
+        if lateral_speed > Config.DRIFT_KILL_SPEED_MPS:
+            self._trigger_land_disarm(
+                f"Drift speed spike — vxy={lateral_speed:.2f}m/s "
+                f"limit={Config.DRIFT_KILL_SPEED_MPS:.2f}m/s"
+            )
+            return
+
+        if abs(pos_x) > Config.DRIFT_KILL_M or abs(pos_y) > Config.DRIFT_KILL_M:
+            self._trigger_land_disarm(
+                f"Drift kill breach — pos=({pos_x:.2f}, {pos_y:.2f}) "
+                f"limit=±{Config.DRIFT_KILL_M:.2f}m"
             )
 
     def _check_lidar_health(self) -> None:
@@ -218,6 +260,7 @@ class FlightSafetyMonitor(threading.Thread):
                 self._check_esp32_heartbeat()
                 self._check_lidar_heartbeat()
                 self._check_lidar_health()
+                self._check_drift_kill()
                 self._check_count += 1
 
             # Periodic diagnostic log
