@@ -3,6 +3,7 @@ ASCEND Phase 1 — Pixhawk MAVLink Interface
 Thread-safe pymavlink wrapper for all flight-controller communication.
 """
 
+import math
 import threading
 import time
 from typing import Any, Optional
@@ -290,6 +291,95 @@ class PixhawkLink:
         Logger.info(f"TAKEOFF command sent → {alt_m:.1f} m")
         return True
 
+    # ── GUIDED_NOGPS Attitude / Position Targets ───────────────────────
+
+    def send_attitude_target(self, roll_rad: float, pitch_rad: float,
+                              yaw_rad: float, thrust: float) -> None:
+        """Send SET_ATTITUDE_TARGET for GUIDED_NOGPS body-frame control.
+
+        Commands the flight controller to hold the given attitude angles
+        and thrust level.  This is the primary control method for indoor
+        non-GPS flight — replaces RC channel overrides.
+
+        Args:
+            roll_rad:  Desired roll angle in radians (positive = right).
+            pitch_rad: Desired pitch angle in radians (positive = nose down).
+            yaw_rad:   Desired yaw angle in radians (0 = north, positive = CW).
+            thrust:    Normalised collective thrust (0.0 … 1.0).
+        """
+        if self._conn is None:
+            return
+
+        # Clamp thrust to [0, 1]
+        thrust = max(0.0, min(1.0, thrust))
+
+        # Convert Euler angles (ZYX convention) → quaternion [w, x, y, z]
+        cr = math.cos(roll_rad  * 0.5)
+        sr = math.sin(roll_rad  * 0.5)
+        cp = math.cos(pitch_rad * 0.5)
+        sp = math.sin(pitch_rad * 0.5)
+        cy = math.cos(yaw_rad   * 0.5)
+        sy = math.sin(yaw_rad   * 0.5)
+
+        q = [
+            cr * cp * cy + sr * sp * sy,   # w
+            sr * cp * cy - cr * sp * sy,   # x
+            cr * sp * cy + sr * cp * sy,   # y
+            cr * cp * sy - sr * sp * cy,   # z
+        ]
+
+        # type_mask: ignore body roll/pitch/yaw RATES (bits 0,1,2)
+        # We command attitude quaternion + thrust only.
+        type_mask = 0b00000111  # ignore body_roll_rate, body_pitch_rate, body_yaw_rate
+
+        with self._send_lock:
+            self._conn.mav.set_attitude_target_send(
+                time_boot_ms=int(time.time() * 1000) & 0xFFFFFFFF,
+                target_system=self._conn.target_system,
+                target_component=self._conn.target_component,
+                type_mask=type_mask,
+                q=q,
+                body_roll_rate=0.0,
+                body_pitch_rate=0.0,
+                body_yaw_rate=0.0,
+                thrust=thrust,
+            )
+
+    def send_position_target_local_ned(self, vx: float = 0.0,
+                                        vy: float = 0.0,
+                                        vz: float = 0.0) -> None:
+        """Send SET_POSITION_TARGET_LOCAL_NED in velocity-only mode.
+
+        Used during landing to command a steady descent rate.  Only
+        velocity fields are set; position and acceleration are ignored.
+
+        Args:
+            vx: North velocity in m/s.
+            vy: East velocity in m/s.
+            vz: Down velocity in m/s (positive = descend).
+        """
+        if self._conn is None:
+            return
+
+        # type_mask: ignore pos (bits 0,1,2), accel (bits 6,7,8),
+        #            yaw (bit 10), yaw_rate (bit 11)
+        # Only use velocity (bits 3,4,5 = 0 → use them)
+        type_mask = 0b0000110111000111
+
+        with self._send_lock:
+            self._conn.mav.set_position_target_local_ned_send(
+                time_boot_ms=int(time.time() * 1000) & 0xFFFFFFFF,
+                target_system=self._conn.target_system,
+                target_component=self._conn.target_component,
+                coordinate_frame=mavutil.mavlink.MAV_FRAME_BODY_NED,
+                type_mask=type_mask,
+                x=0.0, y=0.0, z=0.0,
+                vx=vx, vy=vy, vz=vz,
+                afx=0.0, afy=0.0, afz=0.0,
+                yaw=0.0,
+                yaw_rate=0.0,
+            )
+
     # ── MAVLink Receive ────────────────────────────────────────────────
 
     def recv(self, msg_type: str, timeout: float = 1.0) -> Optional[Any]:
@@ -351,3 +441,174 @@ class PixhawkLink:
                     start_stop=1,
                 )
         Logger.info(f"Requested data streams at {rate_hz} Hz")
+
+    # ── EKF3 Initialization (GPS-denied indoor flight) ─────────────────
+
+    def send_gps_global_origin(self, lat: int = 0, lon: int = 0,
+                                alt: int = 0) -> None:
+        """Send SET_GPS_GLOBAL_ORIGIN to bootstrap EKF3 without GPS.
+
+        This is **mandatory** for EKF3 alignment in GPS-denied mode.
+        Must be sent before any ODOMETRY messages.
+
+        Args:
+            lat: Latitude in degrees × 1e7 (default 0).
+            lon: Longitude in degrees × 1e7 (default 0).
+            alt: Altitude in mm above MSL (default 0).
+        """
+        if self._conn is None:
+            return
+        with self._send_lock:
+            self._conn.mav.set_gps_global_origin_send(
+                target_system=self._conn.target_system,
+                latitude=lat,
+                longitude=lon,
+                altitude=alt,
+                time_usec=int(time.time() * 1e6),
+            )
+        Logger.info(f"SET_GPS_GLOBAL_ORIGIN → ({lat}, {lon}, {alt})")
+
+    def send_home_position(self, lat: int = 0, lon: int = 0,
+                            alt: int = 0) -> None:
+        """Send SET_HOME_POSITION to complete EKF3 origin handshake.
+
+        Sent immediately after SET_GPS_GLOBAL_ORIGIN.
+
+        Args:
+            lat: Latitude in degrees × 1e7 (default 0).
+            lon: Longitude in degrees × 1e7 (default 0).
+            alt: Altitude in mm above MSL (default 0).
+        """
+        if self._conn is None:
+            return
+        # Quaternion [w, x, y, z] = identity (no rotation)
+        q = [1.0, 0.0, 0.0, 0.0]
+        with self._send_lock:
+            self._conn.mav.set_home_position_send(
+                target_system=self._conn.target_system,
+                latitude=lat,
+                longitude=lon,
+                altitude=alt,
+                x=0.0, y=0.0, z=0.0,           # local NED position
+                q=q,
+                approach_x=0.0,
+                approach_y=0.0,
+                approach_z=0.0,
+                time_usec=int(time.time() * 1e6),
+            )
+        Logger.info(f"SET_HOME_POSITION → ({lat}, {lon}, {alt})")
+
+    # ── ODOMETRY (Vision → EKF3 Fusion) ────────────────────────────────
+
+    def send_odometry(self, x: float, y: float, z: float,
+                       vx: float, vy: float, vz: float) -> None:
+        """Send ODOMETRY message (msg ID 331) to feed vision data to EKF3.
+
+        Frame conventions:
+          - Position (x, y, z): MAV_FRAME_LOCAL_NED
+          - Velocity (vx, vy, vz): MAV_FRAME_BODY_FRD
+          - estimator_type: MAV_ESTIMATOR_TYPE_VISION (6)
+
+        Args:
+            x, y, z:    Position in local NED frame (metres).
+            vx, vy, vz: Velocity in body FRD frame (m/s).
+        """
+        if self._conn is None:
+            return
+
+        # Identity quaternion — we don't estimate orientation
+        q = [1.0, 0.0, 0.0, 0.0]
+
+        # Covariance: 21-element upper-triangular (row-major).
+        # Use NaN to indicate "not available" — EKF will use its own.
+        pose_cov = [float('nan')] * 21
+        vel_cov = [float('nan')] * 21
+
+        with self._send_lock:
+            self._conn.mav.odometry_send(
+                time_usec=int(time.time() * 1e6),
+                frame_id=mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+                child_frame_id=mavutil.mavlink.MAV_FRAME_BODY_FRD,
+                x=x, y=y, z=z,
+                q=q,
+                vx=vx, vy=vy, vz=vz,
+                rollspeed=0.0,
+                pitchspeed=0.0,
+                yawspeed=0.0,
+                pose_covariance=pose_cov,
+                velocity_covariance=vel_cov,
+                reset_counter=0,
+                estimator_type=Config.ODOMETRY_ESTIMATOR_TYPE,
+                quality=0,
+            )
+
+    # ── Position + Velocity Target (Local NED) ─────────────────────────
+
+    def send_position_target_local_ned_full(
+        self,
+        x: float = 0.0, y: float = 0.0, z: float = -1.0,
+        vx: float = 0.0, vy: float = 0.0, vz: float = 0.0,
+    ) -> None:
+        """Send SET_POSITION_TARGET_LOCAL_NED with both position AND velocity.
+
+        Used during HOVER for PI drift correction: commands the desired
+        hold position plus a PI-computed velocity nudge.
+
+        Coordinate frame: MAV_FRAME_LOCAL_NED (Z negative = up).
+
+        Args:
+            x, y, z:    Target position (m) in local NED.
+            vx, vy, vz: Target velocity (m/s) in local NED.
+        """
+        if self._conn is None:
+            return
+
+        # type_mask: use position (bits 0,1,2) AND velocity (bits 3,4,5)
+        # Ignore acceleration (bits 6,7,8), yaw (bit 10), yaw_rate (bit 11)
+        type_mask = 0b0000110111000000
+
+        with self._send_lock:
+            self._conn.mav.set_position_target_local_ned_send(
+                time_boot_ms=int(time.time() * 1000) & 0xFFFFFFFF,
+                target_system=self._conn.target_system,
+                target_component=self._conn.target_component,
+                coordinate_frame=mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+                type_mask=type_mask,
+                x=x, y=y, z=z,
+                vx=vx, vy=vy, vz=vz,
+                afx=0.0, afy=0.0, afz=0.0,
+                yaw=0.0,
+                yaw_rate=0.0,
+            )
+
+    # ── NAV_LAND Command ───────────────────────────────────────────────
+
+    def send_land_command(self, x: float = 0.0, y: float = 0.0) -> bool:
+        """Send MAV_CMD_NAV_LAND at the specified local position.
+
+        Args:
+            x: North position in local NED (m).
+            y: East position in local NED (m).
+
+        Returns:
+            ``True`` if the command was sent.
+        """
+        if self._conn is None:
+            return False
+        with self._send_lock:
+            self._conn.mav.command_long_send(
+                target_system=self._conn.target_system,
+                target_component=self._conn.target_component,
+                command=mavutil.mavlink.MAV_CMD_NAV_LAND,
+                confirmation=0,
+                param1=0,       # abort alt (0 = use default)
+                param2=0,       # land mode (0 = default)
+                param3=0,       # empty
+                param4=float('nan'),  # yaw (NaN = use current)
+                param5=x,       # latitude / local X
+                param6=y,       # longitude / local Y
+                param7=0,       # altitude (0 = ground)
+            )
+        Logger.info(f"MAV_CMD_NAV_LAND sent at ({x:.2f}, {y:.2f})")
+        return True
+

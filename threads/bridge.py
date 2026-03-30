@@ -1,10 +1,11 @@
 """
 ASCEND Phase 1 — Daemon Thread Workers
-Provides four background daemons that run alongside the main state machine:
-  • RangefinderBridge — TF-02 → Pixhawk at 20 Hz
-  • HeartbeatSender  — companion heartbeat at 1 Hz
-  • TelemetryStreamer — JSON telemetry to laptop over UDP at 1 Hz
-  • SafetyMonitor    — continuous fault detection
+Provides five background daemons that run alongside the main state machine:
+  • RangefinderBridge   — TF-02 → Pixhawk at 20 Hz
+  • HeartbeatSender     — companion heartbeat at 1 Hz
+  • TelemetryStreamer   — JSON telemetry to laptop over UDP at 1 Hz
+  • SafetyMonitor       — continuous fault detection
+  • SensorFusionBridge  — ESP32-CAM + TF-02 → ODOMETRY at 20 Hz (EKF3 fusion)
 """
 
 import datetime
@@ -284,3 +285,225 @@ class SafetyMonitor(threading.Thread):
         if abs(x) > Config.FENCE_X_M or abs(y) > Config.FENCE_Y_M:
             self._trigger(f"Geofence breach — pos=({x:.1f}, {y:.1f}) "
                           f"limits=±({Config.FENCE_X_M}, {Config.FENCE_Y_M})")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Sensor Fusion Bridge — ESP32-CAM + TF-02 → ODOMETRY → EKF3
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SensorFusionBridge(threading.Thread):
+    """20 Hz sensor fusion daemon: optical flow + lidar → ODOMETRY messages.
+
+    At startup, sends SET_GPS_GLOBAL_ORIGIN and SET_HOME_POSITION to
+    bootstrap EKF3 alignment (mandatory for GPS-denied indoor flight).
+
+    Each iteration at 20 Hz:
+      1. Read pixel displacement from WiFiLKProcessor
+      2. Read altitude from TF02Reader
+      3. Compute real velocity:  V = (pixel_flow × altitude) / focal_length
+      4. Apply low-pass filter:  V_filt = α × V_raw + (1-α) × V_prev
+      5. Integrate velocity → position estimate
+      6. Package into ODOMETRY message (MAV_ESTIMATOR_TYPE_VISION)
+      7. Send to Pixhawk EKF3
+
+    Frame conventions:
+      - Position: MAV_FRAME_LOCAL_NED
+      - Velocity: MAV_FRAME_BODY_FRD
+
+    Args:
+        lk_flow: Running WiFiLKProcessor instance.
+        tf02:    Running TF02Reader instance.
+        pixhawk: Connected PixhawkLink instance.
+    """
+
+    def __init__(self, lk_flow: object, tf02: TF02Reader,
+                 pixhawk: PixhawkLink) -> None:
+        super().__init__(daemon=True, name="SensorFusionBridge")
+        self._lk = lk_flow
+        self._tf02 = tf02
+        self._pixhawk = pixhawk
+
+        self._running = threading.Event()
+        self._running.set()
+        self._lock = threading.Lock()
+
+        # ── Fusion state ──────────────────────────────────────────────
+        self._filtered_vx: float = 0.0
+        self._filtered_vy: float = 0.0
+        self._pos_x: float = 0.0
+        self._pos_y: float = 0.0
+        self._prev_time: float = 0.0
+
+        # ── Heartbeat timestamps (for safety monitor) ─────────────────
+        self._last_esp32_time: float = 0.0
+        self._last_lidar_time: float = 0.0
+        self._diag_last_log: float = 0.0
+
+    # ── Thread-safe Properties ─────────────────────────────────────────
+
+    @property
+    def filtered_vx(self) -> float:
+        """Latest filtered X velocity (m/s, body-forward)."""
+        with self._lock:
+            return self._filtered_vx
+
+    @property
+    def filtered_vy(self) -> float:
+        """Latest filtered Y velocity (m/s, body-right)."""
+        with self._lock:
+            return self._filtered_vy
+
+    @property
+    def last_esp32_time(self) -> float:
+        """``time.time()`` of most recent valid ESP32-CAM data."""
+        with self._lock:
+            return self._last_esp32_time
+
+    @property
+    def last_lidar_time(self) -> float:
+        """``time.time()`` of most recent valid TF02 data."""
+        with self._lock:
+            return self._last_lidar_time
+
+    @property
+    def position(self) -> tuple:
+        """Return ``(x, y)`` integrated position estimate in metres."""
+        with self._lock:
+            return (self._pos_x, self._pos_y)
+
+    def stop(self) -> None:
+        """Signal the fusion thread to stop."""
+        self._running.clear()
+
+    # ── EKF3 Initialization ────────────────────────────────────────────
+
+    def _init_ekf(self) -> None:
+        """Send SET_GPS_GLOBAL_ORIGIN + SET_HOME_POSITION at (0,0,0).
+
+        Mandatory for EKF3 alignment in GPS-denied mode.  Sent once at
+        thread startup before the fusion loop begins.
+        """
+        lat = Config.EKF_ORIGIN_LAT
+        lon = Config.EKF_ORIGIN_LON
+        alt = Config.EKF_ORIGIN_ALT
+
+        Logger.info("EKF_INIT: Sending GPS origin + home position …")
+        self._pixhawk.send_gps_global_origin(lat, lon, alt)
+        time.sleep(0.1)  # small gap to ensure ordering
+        self._pixhawk.send_home_position(lat, lon, alt)
+        time.sleep(0.1)
+        # Send a second time for reliability (some FC firmware needs it)
+        self._pixhawk.send_gps_global_origin(lat, lon, alt)
+        time.sleep(0.1)
+        self._pixhawk.send_home_position(lat, lon, alt)
+        Logger.ok("EKF_INIT: GPS origin and home position set at (0, 0, 0) — "
+                   "EKF3 alignment should begin")
+
+    # ── Fusion Step ────────────────────────────────────────────────────
+
+    def _fusion_step(self) -> None:
+        """One iteration of the sensor fusion loop."""
+        now = time.time()
+
+        # ── Read sensors ──────────────────────────────────────────────
+        # ESP32-CAM optical flow
+        if self._lk is None:
+            return
+
+        dx, dy, quality = self._lk.get_flow()
+        alt_m = self._tf02.distance_m
+
+        # Gate: need both valid flow and altitude
+        if quality < 1 or alt_m is None or alt_m < Config.VIO_MIN_ALT_M:
+            # Keep sending last-known data — don't zero out
+            if self._prev_time > 0:
+                self._pixhawk.send_odometry(
+                    x=self._pos_x, y=self._pos_y, z=-alt_m if alt_m else 0.0,
+                    vx=self._filtered_vx, vy=self._filtered_vy, vz=0.0,
+                )
+            return
+
+        # ── Update heartbeat timestamps ───────────────────────────────
+        with self._lock:
+            if self._lk.data_age < 1.0:
+                self._last_esp32_time = now
+            if self._tf02.data_age < 1.0:
+                self._last_lidar_time = now
+
+        # ── Compute dt ────────────────────────────────────────────────
+        if self._prev_time == 0.0:
+            self._prev_time = now
+            return
+        dt = now - self._prev_time
+        if dt <= 0.001 or dt > 0.5:
+            self._prev_time = now
+            return
+        self._prev_time = now
+
+        # ── MATH: Real velocity (m/s) ─────────────────────────────────
+        # V_true = (Pixel_Flow × Lidar_Altitude) / Focal_Length_Pixels
+        raw_vx = (dx * alt_m) / Config.VIO_FOCAL_LENGTH_PX
+        raw_vy = (dy * alt_m) / Config.VIO_FOCAL_LENGTH_PX
+
+        # ── Low-Pass Filter (α = 0.2) ─────────────────────────────────
+        # Eliminates high-frequency motor noise from flow measurements.
+        alpha = Config.LPF_ALPHA
+        with self._lock:
+            self._filtered_vx = alpha * raw_vx + (1.0 - alpha) * self._filtered_vx
+            self._filtered_vy = alpha * raw_vy + (1.0 - alpha) * self._filtered_vy
+            fvx = self._filtered_vx
+            fvy = self._filtered_vy
+
+        # ── Integrate velocity → position ─────────────────────────────
+        with self._lock:
+            self._pos_x += fvx * dt
+            self._pos_y += fvy * dt
+            px, py = self._pos_x, self._pos_y
+
+        # ── Send ODOMETRY to EKF3 ─────────────────────────────────────
+        # Position: MAV_FRAME_LOCAL_NED (z negative = up)
+        # Velocity: MAV_FRAME_BODY_FRD
+        self._pixhawk.send_odometry(
+            x=px, y=py, z=-alt_m,
+            vx=fvx, vy=fvy, vz=0.0,
+        )
+
+    # ── Thread Entry ───────────────────────────────────────────────────
+
+    def run(self) -> None:
+        """Run EKF init, then 20 Hz sensor fusion loop."""
+        Logger.info(f"SensorFusionBridge starting at {Config.FUSION_RATE_HZ} Hz")
+
+        # ── Phase 1: EKF3 initialization ──────────────────────────────
+        self._init_ekf()
+
+        # ── Phase 2: Fusion loop at 20 Hz ─────────────────────────────
+        Logger.info(
+            f"Fusion loop active — "
+            f"LPF α={Config.LPF_ALPHA}, "
+            f"focal={Config.VIO_FOCAL_LENGTH_PX}px, "
+            f"estimator=VISION({Config.ODOMETRY_ESTIMATOR_TYPE})"
+        )
+
+        while self._running.is_set():
+            try:
+                self._fusion_step()
+            except Exception as exc:
+                Logger.warn(f"SensorFusionBridge error: {exc}")
+
+            # Diagnostic log every 2 seconds
+            now = time.time()
+            if now - self._diag_last_log >= 2.0:
+                self._diag_last_log = now
+                with self._lock:
+                    Logger.info(
+                        f"FUSION | vx={self._filtered_vx:+.3f} "
+                        f"vy={self._filtered_vy:+.3f} m/s | "
+                        f"pos=({self._pos_x:+.2f}, {self._pos_y:+.2f}) m | "
+                        f"alt={self._tf02.distance_m or 0:.2f}m"
+                    )
+
+            time.sleep(Config.FUSION_INTERVAL)
+
+        Logger.info("SensorFusionBridge stopped")
+

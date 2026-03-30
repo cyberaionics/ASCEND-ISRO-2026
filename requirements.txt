@@ -1,0 +1,18 @@
+# ═══════════════════════════════════════════════════════════════════
+# ASCEND — Python Dependencies (RPi4 + Pixhawk 2.4.8)
+# Install: pip3 install -r requirements.txt
+# ═══════════════════════════════════════════════════════════════════
+
+# ── MAVLink Communication ─────────────────────────────────────────
+pymavlink>=2.4.41
+
+# ── Serial (TF-02 LiDAR UART) ────────────────────────────────────
+pyserial>=3.5
+
+# ── Computer Vision (Optical Flow on RPi4) ────────────────────────
+# Use opencv-contrib-python-headless for RPi (no GUI needed).
+# If you're on a desktop for testing, use opencv-contrib-python instead.
+opencv-contrib-python-headless>=4.8.0
+
+# ── NumPy (required by OpenCV and flow math) ──────────────────────
+numpy>=1.24.0

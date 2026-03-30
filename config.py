@@ -29,7 +29,7 @@ class Config:
 
     # ── Serial Ports ───────────────────────────────────────────────────
     PIXHAWK_PORT: str = "/dev/ttyACM0"
-    PIXHAWK_BAUD: int = 115200
+    PIXHAWK_BAUD: int = 921600
 
     TF02_PORT: str = "/dev/serial0"
     TF02_BAUD: int = 115200
@@ -182,8 +182,8 @@ class Config:
     HOVER_TARGET_ALT_M: float = 0.5     # lowered from 1.0 — indoor net above
     ALT_TOLERANCE_M: float = 0.15
     ALT_STABLE_TIME: float = 2.0
-    HOVER_DURATION: float = 15.0        # shorter hover for indoor testing
-    HOVER_DURATION_S: float = 15.0      # shorter hover for indoor testing
+    HOVER_DURATION: float = 60.0        # 60-second precision hover
+    HOVER_DURATION_S: float = 60.0      # 60-second precision hover
     HOVER_KP_ALT: float = 200.0        # PWM per metre error
     BASE_THROTTLE_PWM: int = 1550
     MIN_THROTTLE_PWM: int = 1100
@@ -232,6 +232,60 @@ class Config:
     WHITE_V_MIN: int = 160             # min brightness for a "white" pixel (0-255)
     WHITE_CHECK_ENABLED: bool = True
     WHITE_GRACE_S: float = 8.0         # ignore white check for first 8s after takeoff
+
+    # ── GUIDED_NOGPS Flight Parameters ────────────────────────────────
+    # All thrust values are normalised (0.0 – 1.0).
+    # Angles are in radians.
+    GUIDED_BASE_THRUST: float = 0.45       # hover thrust (tune to your airframe)
+    GUIDED_MAX_THRUST: float = 0.65        # absolute max thrust (safety cap)
+    GUIDED_MIN_THRUST: float = 0.0         # minimum thrust
+    GUIDED_TAKEOFF_START_THRUST: float = 0.20  # starting thrust for ramp
+    GUIDED_TAKEOFF_MAX_THRUST: float = 0.55    # max thrust during takeoff ramp
+    GUIDED_TAKEOFF_RAMP_STEP: float = 0.005    # thrust increment per step
+    GUIDED_HOVER_KP_ALT: float = 0.15     # thrust per metre altitude error
+    GUIDED_MAX_TILT_RAD: float = 0.087     # max roll/pitch (~5°, indoor-safe)
+    GUIDED_LAND_DESCENT_RATE: float = 0.3  # m/s descent during landing
+    GUIDED_YAW_RAD: float = 0.0            # default yaw (0 = current heading)
+
+    # ── GUIDED_NOGPS VIO PID Gains (output in radians) ────────────────
+    # These produce body-frame angles, not PWM offsets.
+    # ~5× smaller than PWM gains because output range is ±0.087 rad vs ±150 PWM.
+    GUIDED_LK_VIO_KP: float = 0.12
+    GUIDED_LK_VIO_KI: float = 0.015
+    GUIDED_LK_VIO_KD: float = 0.006
+
+    GUIDED_ORB_VIO_KP: float = 0.15
+    GUIDED_ORB_VIO_KI: float = 0.020
+    GUIDED_ORB_VIO_KD: float = 0.008
+
+    # ── Roll / Pitch Trim (GUIDED_NOGPS, radians) ─────────────────────
+    # Same purpose as TRIM_ROLL_PWM / TRIM_PITCH_PWM but in radians.
+    GUIDED_TRIM_ROLL_RAD: float = 0.0
+    GUIDED_TRIM_PITCH_RAD: float = 0.0
+
+    # ── Sensor Fusion Engine ───────────────────────────────────────────
+    FUSION_RATE_HZ: int = 20
+    FUSION_INTERVAL: float = 1.0 / 20       # 50 ms
+    LPF_ALPHA: float = 0.2                  # low-pass filter coefficient
+    ODOMETRY_ESTIMATOR_TYPE: int = 6        # MAV_ESTIMATOR_TYPE_VISION
+
+    # ── EKF3 Origin (fake GPS origin for indoor flight) ───────────────
+    EKF_ORIGIN_LAT: int = 0                 # degrees × 1e7
+    EKF_ORIGIN_LON: int = 0                 # degrees × 1e7
+    EKF_ORIGIN_ALT: int = 0                 # mm above MSL
+    EKF_INIT_TIMEOUT: float = 30.0          # max wait for EKF convergence
+
+    # ── Position Hold PID (Python-side drift monitor) ─────────────────
+    POS_HOLD_KP: float = 0.5
+    POS_HOLD_KI: float = 0.01
+    POS_HOLD_INTEGRAL_MAX: float = 2.0      # anti-windup clamp (m/s)
+    HOVER_TARGET_X: float = 0.0             # NED X target (m)
+    HOVER_TARGET_Y: float = 0.0             # NED Y target (m)
+    HOVER_TARGET_Z: float = -1.0            # NED Z target (m) — negative = up
+
+    # ── Safety Monitor Thresholds ─────────────────────────────────────
+    STREAM_LATENCY_MAX_S: float = 0.250     # 250 ms max sensor latency
+    SAFETY_MONITOR_HZ: int = 20             # safety check rate
 
     # ── Safety Thresholds ──────────────────────────────────────────────
     TF02_DATA_TIMEOUT: float = 2.0
@@ -330,6 +384,9 @@ class Config:
         "LAND":         9,
         "DRIFT":        11,
         "SPORT":        13,
+        "AUTOTUNE":     15,
+        "POSHOLD":      16,
+        "BRAKE":        17,
         "GUIDED_NOGPS": 20,
-        "AUTOTUNE":     17,
+        "FLOWHOLD":     22,
     }

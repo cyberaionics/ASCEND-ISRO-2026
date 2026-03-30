@@ -1,12 +1,27 @@
 """
-ASCEND Phase 1 — AutoTune Monitor
-Passive MAVLink monitor during pilot-flown AutoTune flights.
-Does NOT control the drone — only observes and reports.
+ASCEND — Flight Safety Monitor
+Real-time daemon that monitors sensor health and triggers BRAKE mode
+on failure.
+
+Monitored conditions:
+  1. ESP32-CAM stream latency:  > 250 ms → BRAKE
+  2. TF-02 Lidar data age:     > 250 ms → BRAKE
+  3. TF-02 health check:       signal strength failure → BRAKE
+
+The monitor reads timestamps from the SensorFusionBridge to determine
+if data streams are stale.  On any failure, it sends MAV_CMD_DO_SET_MODE
+with BRAKE mode to immediately stop the drone.
+
+Runs at 20 Hz in its own daemon thread.
+
+Note: The original AutoTuneMonitor class is preserved at the bottom of
+this file for backward compatibility.
 """
 
 import datetime
 import json
 import os
+import threading
 import time
 from typing import Optional
 
@@ -15,7 +30,218 @@ from pymavlink import mavutil
 from ..config import Config
 from ..logger import Logger
 from ..hardware.pixhawk import PixhawkLink
+from ..hardware.tf02 import TF02Reader
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Flight Safety Monitor — replaces passive AutoTune monitor
+# ═══════════════════════════════════════════════════════════════════════════
+
+class FlightSafetyMonitor(threading.Thread):
+    """Active safety daemon that monitors sensor heartbeats at 20 Hz.
+
+    Checks:
+      1. ESP32-CAM stream latency (from SensorFusionBridge.last_esp32_time)
+      2. TF-02 LiDAR data age (from TF02Reader.data_age)
+      3. TF-02 signal strength health
+
+    If any stream latency exceeds 250 ms OR lidar health fails,
+    immediately sends MAV_CMD_DO_SET_MODE → BRAKE mode and sets
+    the emergency flag.
+
+    Args:
+        pixhawk:       Connected PixhawkLink instance.
+        tf02:          Running TF02Reader instance.
+        fusion_bridge: Running SensorFusionBridge instance (provides timestamps).
+    """
+
+    def __init__(self, pixhawk: PixhawkLink, tf02: TF02Reader,
+                 fusion_bridge: object) -> None:
+        super().__init__(daemon=True, name="FlightSafetyMonitor")
+        self._px = pixhawk
+        self._tf02 = tf02
+        self._fusion = fusion_bridge
+
+        self._running = threading.Event()
+        self._running.set()
+        self._lock = threading.Lock()
+
+        self._emergency_flag: bool = False
+        self._emergency_reason: str = ""
+        self._flight_active: bool = False
+
+        # Prevent duplicate triggers
+        self._triggered: bool = False
+
+        # Diagnostic
+        self._last_log: float = 0.0
+        self._check_count: int = 0
+
+    # ── Thread-safe Properties ─────────────────────────────────────────
+
+    @property
+    def emergency_flag(self) -> bool:
+        """``True`` if an emergency condition has been detected."""
+        with self._lock:
+            return self._emergency_flag
+
+    @property
+    def emergency_reason(self) -> str:
+        """Human-readable reason for the emergency."""
+        with self._lock:
+            return self._emergency_reason
+
+    def get_emergency(self) -> bool:
+        """Callable interface for MissionController safety check."""
+        return self.emergency_flag
+
+    def set_flight_active(self, active: bool) -> None:
+        """Enable or disable in-flight safety checks.
+
+        Args:
+            active: ``True`` when the drone is armed and flying.
+        """
+        with self._lock:
+            self._flight_active = active
+            if not active:
+                self._triggered = False
+
+    def reset(self) -> None:
+        """Clear the emergency flag (e.g. after landing)."""
+        with self._lock:
+            self._emergency_flag = False
+            self._emergency_reason = ""
+            self._triggered = False
+
+    def stop(self) -> None:
+        """Signal the monitor thread to stop."""
+        self._running.clear()
+
+    # ── Emergency Trigger ──────────────────────────────────────────────
+
+    def _trigger_brake(self, reason: str) -> None:
+        """Send BRAKE mode and set emergency flag.
+
+        Only triggers once per flight — avoids flooding the FC with
+        mode change commands.
+        """
+        with self._lock:
+            if self._triggered:
+                return
+            self._triggered = True
+            self._emergency_flag = True
+            self._emergency_reason = reason
+
+        Logger.error(f"⚠ SAFETY BRAKE: {reason}")
+        Logger.error("Sending MAV_CMD_DO_SET_MODE → BRAKE")
+
+        # Send BRAKE mode via set_mode (which uses MAV_CMD_DO_SET_MODE)
+        try:
+            self._px.set_mode("BRAKE")
+        except Exception as exc:
+            Logger.error(f"BRAKE mode failed: {exc} — trying LAND")
+            try:
+                self._px.set_mode("LAND")
+            except Exception:
+                Logger.error("LAND mode also failed — critical failure")
+
+    # ── Health Checks ──────────────────────────────────────────────────
+
+    def _check_esp32_heartbeat(self) -> None:
+        """Check ESP32-CAM stream latency.
+
+        Triggers BRAKE if no data received for > 250 ms.
+        """
+        if self._fusion is None:
+            return
+
+        last_time = self._fusion.last_esp32_time
+        if last_time == 0.0:
+            return  # not yet initialized
+
+        latency = time.time() - last_time
+        if latency > Config.STREAM_LATENCY_MAX_S:
+            self._trigger_brake(
+                f"ESP32-CAM stream stale — latency={latency*1000:.0f}ms "
+                f"> {Config.STREAM_LATENCY_MAX_S*1000:.0f}ms limit"
+            )
+
+    def _check_lidar_heartbeat(self) -> None:
+        """Check TF-02 LiDAR data age.
+
+        Triggers BRAKE if data_age > 250 ms.
+        """
+        data_age = self._tf02.data_age
+        if data_age == float("inf"):
+            return  # not yet initialized
+
+        if data_age > Config.STREAM_LATENCY_MAX_S:
+            self._trigger_brake(
+                f"TF-02 LiDAR stale — data_age={data_age*1000:.0f}ms "
+                f"> {Config.STREAM_LATENCY_MAX_S*1000:.0f}ms limit"
+            )
+
+    def _check_lidar_health(self) -> None:
+        """Check TF-02 signal strength and range validity.
+
+        Triggers BRAKE if readings are consistently out of range.
+        """
+        dist_cm = self._tf02.distance_cm
+        strength = self._tf02.strength
+
+        if dist_cm is None:
+            return  # no data yet
+
+        # Signal strength too low (sensor obstruction or malfunction)
+        if strength < 50 and dist_cm > Config.TF02_MAX_CM:
+            self._trigger_brake(
+                f"TF-02 health check FAILED — "
+                f"dist={dist_cm}cm, strength={strength} "
+                f"(out of range or obstructed)"
+            )
+
+    # ── Thread Entry ───────────────────────────────────────────────────
+
+    def run(self) -> None:
+        """Poll safety conditions at 20 Hz."""
+        Logger.info(
+            f"FlightSafetyMonitor running at {Config.SAFETY_MONITOR_HZ} Hz | "
+            f"latency limit: {Config.STREAM_LATENCY_MAX_S*1000:.0f}ms"
+        )
+        interval = 1.0 / Config.SAFETY_MONITOR_HZ
+
+        while self._running.is_set():
+            with self._lock:
+                flight_active = self._flight_active
+
+            if flight_active and not self._triggered:
+                self._check_esp32_heartbeat()
+                self._check_lidar_heartbeat()
+                self._check_lidar_health()
+                self._check_count += 1
+
+            # Periodic diagnostic log
+            now = time.time()
+            if now - self._last_log >= 5.0 and flight_active:
+                self._last_log = now
+                esp32_age = (time.time() - self._fusion.last_esp32_time) * 1000 \
+                    if self._fusion and self._fusion.last_esp32_time > 0 else -1
+                lidar_age = self._tf02.data_age * 1000
+                Logger.info(
+                    f"SAFETY | checks={self._check_count} | "
+                    f"esp32_latency={esp32_age:.0f}ms | "
+                    f"lidar_latency={lidar_age:.0f}ms | "
+                    f"status={'ARMED' if not self._triggered else 'TRIGGERED'}"
+                )
+
+            time.sleep(interval)
+
+        Logger.info("FlightSafetyMonitor stopped")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AutoTune Monitor (kept for backward compatibility)
+# ═══════════════════════════════════════════════════════════════════════════
 
 # ArduCopter mode number for AutoTune
 _MODE_AUTOTUNE = Config.MODE_MAP["AUTOTUNE"]
