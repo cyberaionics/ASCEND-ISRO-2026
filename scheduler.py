@@ -188,9 +188,10 @@ class Scheduler:
             f"{Config.STREAM_LATENCY_MAX_S * 1000:.0f}ms"
         )
 
-        # ── 7. HeartbeatSender + RangefinderBridge ────────────────────
+        # ── 7. HeartbeatSender + RangefinderBridge + TelemetryStreamer ────────────────────
         self._start_heartbeat()
         self._start_bridge()
+        self._start_telemetry_streamer()
 
         # ── 8. MissionController (blocking state machine) ─────────────
         Logger.header("LAUNCHING MISSION CONTROLLER")
@@ -284,6 +285,15 @@ class Scheduler:
         bridge = RangefinderBridge(self._tf02, self._pixhawk)
         bridge.start()
         self._threads.append(bridge)
+
+    def _start_telemetry_streamer(self) -> None:
+        import queue
+        q = queue.Queue(maxsize=200)
+        if self._pixhawk:
+            self._pixhawk.set_telemetry_queue(q)
+        streamer = TelemetryStreamer(message_queue=q)
+        streamer.start()
+        self._threads.append(streamer)
 
     def _start_heartbeat(self) -> None:
         hb = HeartbeatSender(self._pixhawk)

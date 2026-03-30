@@ -200,6 +200,31 @@ class FlightSafetyMonitor(threading.Thread):
                 f"(out of range or obstructed)"
             )
 
+    def _check_drift_and_velocity(self) -> None:
+        """Immediate hard-kill for high-speed drifting.
+        
+        If velocity spikes > 1.2 m/s or position > DRIFT_KILL_M,
+        drop the drone instantly before it hits a wall.
+        """
+        if not Config.DRIFT_KILL_ENABLED:
+            return
+
+        px, py = self._fusion.position
+        vx = self._fusion.filtered_vx
+        vy = self._fusion.filtered_vy
+        
+        # Super-fast drift kill
+        if abs(vx) > 1.2 or abs(vy) > 1.2:
+            self._trigger_brake(f"HARD-KILL Velocity Spike: ({vx:.2f}, {vy:.2f}) m/s")
+            self._px.set_mode("LAND")
+            self._px.disarm()
+            
+        # Positional boundary kill
+        elif abs(px) > Config.DRIFT_KILL_M or abs(py) > Config.DRIFT_KILL_M:
+            self._trigger_brake(f"HARD-KILL Bounds Exceeded: ({px:.1f}, {py:.1f}) m")
+            self._px.set_mode("LAND")
+            self._px.disarm()
+
     # ── Thread Entry ───────────────────────────────────────────────────
 
     def run(self) -> None:
@@ -218,6 +243,7 @@ class FlightSafetyMonitor(threading.Thread):
                 self._check_esp32_heartbeat()
                 self._check_lidar_heartbeat()
                 self._check_lidar_health()
+                self._check_drift_and_velocity()
                 self._check_count += 1
 
             # Periodic diagnostic log

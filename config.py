@@ -221,7 +221,7 @@ class Config:
     # ── VIO Drift Kill (emergency motor kill if drone drifts off board) ─
     # If accumulated X-Y displacement exceeds this, IMMEDIATE DISARM.
     # The white board is small — drone must not drift beyond it.
-    DRIFT_KILL_M: float = 1.0          # max allowed drift from takeoff position
+    DRIFT_KILL_M: float = 0.8          # max allowed drift from takeoff position
     DRIFT_KILL_ENABLED: bool = True
 
     # ── White Board Detection (camera-based landing pad check) ────────
@@ -236,13 +236,13 @@ class Config:
     # ── GUIDED_NOGPS Flight Parameters ────────────────────────────────
     # All thrust values are normalised (0.0 – 1.0).
     # Angles are in radians.
-    GUIDED_BASE_THRUST: float = 0.45       # hover thrust (tune to your airframe)
+    GUIDED_BASE_THRUST: float = 0.48       # hover thrust (tune to your airframe)
     GUIDED_MAX_THRUST: float = 0.65        # absolute max thrust (safety cap)
     GUIDED_MIN_THRUST: float = 0.0         # minimum thrust
     GUIDED_TAKEOFF_START_THRUST: float = 0.20  # starting thrust for ramp
     GUIDED_TAKEOFF_MAX_THRUST: float = 0.55    # max thrust during takeoff ramp
     GUIDED_TAKEOFF_RAMP_STEP: float = 0.005    # thrust increment per step
-    GUIDED_HOVER_KP_ALT: float = 0.15     # thrust per metre altitude error
+    GUIDED_HOVER_KP_ALT: float = 0.2      # thrust per metre altitude error
     GUIDED_MAX_TILT_RAD: float = 0.087     # max roll/pitch (~5°, indoor-safe)
     GUIDED_LAND_DESCENT_RATE: float = 0.3  # m/s descent during landing
     GUIDED_YAW_RAD: float = 0.0            # default yaw (0 = current heading)
@@ -266,7 +266,7 @@ class Config:
     # ── Sensor Fusion Engine ───────────────────────────────────────────
     FUSION_RATE_HZ: int = 20
     FUSION_INTERVAL: float = 1.0 / 20       # 50 ms
-    LPF_ALPHA: float = 0.2                  # low-pass filter coefficient
+    LPF_ALPHA: float = 0.3                  # low-pass filter coefficient
     ODOMETRY_ESTIMATOR_TYPE: int = 6        # MAV_ESTIMATOR_TYPE_VISION
 
     # ── EKF3 Origin (fake GPS origin for indoor flight) ───────────────
@@ -276,9 +276,9 @@ class Config:
     EKF_INIT_TIMEOUT: float = 30.0          # max wait for EKF convergence
 
     # ── Position Hold PID (Python-side drift monitor) ─────────────────
-    POS_HOLD_KP: float = 0.5
-    POS_HOLD_KI: float = 0.01
-    POS_HOLD_INTEGRAL_MAX: float = 2.0      # anti-windup clamp (m/s)
+    POS_HOLD_KP: float = 0.65
+    POS_HOLD_KI: float = 0.015
+    POS_HOLD_INTEGRAL_MAX: float = 1.0      # anti-windup clamp (m/s)
     HOVER_TARGET_X: float = 0.0             # NED X target (m)
     HOVER_TARGET_Y: float = 0.0             # NED Y target (m)
     HOVER_TARGET_Z: float = -1.0            # NED Z target (m) — negative = up
@@ -288,7 +288,7 @@ class Config:
     SAFETY_MONITOR_HZ: int = 20             # safety check rate
 
     # ── Safety Thresholds ──────────────────────────────────────────────
-    TF02_DATA_TIMEOUT: float = 2.0
+    TF02_DATA_TIMEOUT: float = 0.5
     WIFI_HB_TIMEOUT: float = 3.0
     LOW_BATTERY_VOLT: float = 14.0
     CRITICAL_BATTERY_VOLT: float = 13.2

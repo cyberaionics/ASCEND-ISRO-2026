@@ -101,20 +101,21 @@ class HeartbeatSender(threading.Thread):
 # Telemetry Streamer
 # ═══════════════════════════════════════════════════════════════════════════
 
-class TelemetryStreamer(threading.Thread):
-    """Streams live telemetry as JSON over UDP to the laptop at 1 Hz.
+import queue
 
-    The laptop runs as a Wi-Fi hotspot; RPi5 is a client. Telemetry
-    is sent as one JSON packet per second on the configured UDP port.
+class TelemetryStreamer(threading.Thread):
+    """Transparent MAVLink bridge over UDP.
+
+    Consumes raw MAVLink byte arrays from a shared queue and streams them
+    to the laptop for Mission Planner integration.
 
     Args:
-        state_getter: Callable returning a dict with all current telemetry
-                      fields (populated by the state machine or scheduler).
+        message_queue: A thread-safe queue containing raw MAVLink packet bytes.
     """
 
-    def __init__(self, state_getter: Callable[[], dict]) -> None:
+    def __init__(self, message_queue: queue.Queue) -> None:
         super().__init__(daemon=True, name="TelemetryStreamer")
-        self._get_state = state_getter
+        self._queue = message_queue
         self._running = threading.Event()
         self._running.set()
         self._sock: Optional[socket.socket] = None
@@ -135,14 +136,12 @@ class TelemetryStreamer(threading.Thread):
         dest = (Config.LAPTOP_IP, Config.TELEMETRY_PORT)
         while self._running.is_set():
             try:
-                state = self._get_state()
-                state["timestamp"] = datetime.datetime.now().isoformat()
-                packet = json.dumps(state).encode("utf-8")
+                packet = self._queue.get(timeout=0.5)
                 self._sock.sendto(packet, dest)
-            except Exception:
-                # Laptop may not be reachable — silently continue
+            except queue.Empty:
                 pass
-            time.sleep(Config.TELEMETRY_INTERVAL)
+            except Exception:
+                pass
 
         self._sock.close()
         Logger.info("TelemetryStreamer stopped")
@@ -261,6 +260,7 @@ class SafetyMonitor(threading.Thread):
                 self._check_tf02()
                 self._check_wifi()
                 self._check_geofence()
+                self._check_drift_kill()
 
             time.sleep(0.1)
         Logger.info("SafetyMonitor stopped")
@@ -285,6 +285,20 @@ class SafetyMonitor(threading.Thread):
         if abs(x) > Config.FENCE_X_M or abs(y) > Config.FENCE_Y_M:
             self._trigger(f"Geofence breach — pos=({x:.1f}, {y:.1f}) "
                           f"limits=±({Config.FENCE_X_M}, {Config.FENCE_Y_M})")
+
+    def _check_drift_kill(self) -> None:
+        """Trigger HARD-KILL if drone drifts beyond DRIFT_KILL_M limit."""
+        if not Config.DRIFT_KILL_ENABLED:
+            return
+        with self._lock:
+            x, y = self._pos_x, self._pos_y
+        if abs(x) > Config.DRIFT_KILL_M or abs(y) > Config.DRIFT_KILL_M:
+            Logger.error(f"HARD-KILL: Drift exceeded limit ({Config.DRIFT_KILL_M}m) "
+                         f"pos=({x:.1f}, {y:.1f})")
+            self._pixhawk.set_mode("LAND")
+            time.sleep(0.1)
+            self._pixhawk.disarm()
+            self._trigger(f"HARD-KILL Drift condition met — DISARMED")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -388,14 +402,11 @@ class SensorFusionBridge(threading.Thread):
         alt = Config.EKF_ORIGIN_ALT
 
         Logger.info("EKF_INIT: Sending GPS origin + home position …")
-        self._pixhawk.send_gps_global_origin(lat, lon, alt)
-        time.sleep(0.1)  # small gap to ensure ordering
-        self._pixhawk.send_home_position(lat, lon, alt)
-        time.sleep(0.1)
-        # Send a second time for reliability (some FC firmware needs it)
-        self._pixhawk.send_gps_global_origin(lat, lon, alt)
-        time.sleep(0.1)
-        self._pixhawk.send_home_position(lat, lon, alt)
+        for _ in range(5):
+            self._pixhawk.send_gps_global_origin(lat, lon, alt)
+            time.sleep(0.2)
+            self._pixhawk.send_home_position(lat, lon, alt)
+            time.sleep(0.2)
         Logger.ok("EKF_INIT: GPS origin and home position set at (0, 0, 0) — "
                    "EKF3 alignment should begin")
 
@@ -413,16 +424,6 @@ class SensorFusionBridge(threading.Thread):
         dx, dy, quality = self._lk.get_flow()
         alt_m = self._tf02.distance_m
 
-        # Gate: need both valid flow and altitude
-        if quality < 1 or alt_m is None or alt_m < Config.VIO_MIN_ALT_M:
-            # Keep sending last-known data — don't zero out
-            if self._prev_time > 0:
-                self._pixhawk.send_odometry(
-                    x=self._pos_x, y=self._pos_y, z=-alt_m if alt_m else 0.0,
-                    vx=self._filtered_vx, vy=self._filtered_vy, vz=0.0,
-                )
-            return
-
         # ── Update heartbeat timestamps ───────────────────────────────
         with self._lock:
             if self._lk.data_age < 1.0:
@@ -435,36 +436,36 @@ class SensorFusionBridge(threading.Thread):
             self._prev_time = now
             return
         dt = now - self._prev_time
-        if dt <= 0.001 or dt > 0.5:
-            self._prev_time = now
-            return
         self._prev_time = now
 
-        # ── MATH: Real velocity (m/s) ─────────────────────────────────
-        # V_true = (Pixel_Flow × Lidar_Altitude) / Focal_Length_Pixels
-        raw_vx = (dx * alt_m) / Config.VIO_FOCAL_LENGTH_PX
-        raw_vy = (dy * alt_m) / Config.VIO_FOCAL_LENGTH_PX
+        # ── Only integrate if dt valid and sensors healthy ────────────
+        valid_dt = 0.001 < dt <= 0.5
+        valid_sensors = quality >= 1 and alt_m is not None and alt_m >= Config.VIO_MIN_ALT_M
 
-        # ── Low-Pass Filter (α = 0.2) ─────────────────────────────────
-        # Eliminates high-frequency motor noise from flow measurements.
-        alpha = Config.LPF_ALPHA
-        with self._lock:
-            self._filtered_vx = alpha * raw_vx + (1.0 - alpha) * self._filtered_vx
-            self._filtered_vy = alpha * raw_vy + (1.0 - alpha) * self._filtered_vy
-            fvx = self._filtered_vx
-            fvy = self._filtered_vy
+        if valid_dt and valid_sensors:
+            # ── MATH: Real velocity (m/s) ─────────────────────────────────
+            # V_true = (Pixel_Flow × Lidar_Altitude) / Focal_Length_Pixels
+            raw_vx = (dx * alt_m) / Config.VIO_FOCAL_LENGTH_PX
+            raw_vy = (dy * alt_m) / Config.VIO_FOCAL_LENGTH_PX
 
-        # ── Integrate velocity → position ─────────────────────────────
+            # ── Low-Pass Filter ───────────────────────────────────────────
+            alpha = Config.LPF_ALPHA
+            with self._lock:
+                self._filtered_vx = alpha * raw_vx + (1.0 - alpha) * self._filtered_vx
+                self._filtered_vy = alpha * raw_vy + (1.0 - alpha) * self._filtered_vy
+                
+                self._pos_x += self._filtered_vx * dt
+                self._pos_y += self._filtered_vy * dt
+
+        # ── Send strictly at 20Hz ─────────────────────────────────────
         with self._lock:
-            self._pos_x += fvx * dt
-            self._pos_y += fvy * dt
+            fvx, fvy = self._filtered_vx, self._filtered_vy
             px, py = self._pos_x, self._pos_y
 
-        # ── Send ODOMETRY to EKF3 ─────────────────────────────────────
-        # Position: MAV_FRAME_LOCAL_NED (z negative = up)
-        # Velocity: MAV_FRAME_BODY_FRD
+        z_val = -alt_m if alt_m is not None else 0.0
+
         self._pixhawk.send_odometry(
-            x=px, y=py, z=-alt_m,
+            x=px, y=py, z=z_val,
             vx=fvx, vy=fvy, vz=0.0,
         )
 

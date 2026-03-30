@@ -4,6 +4,7 @@ Thread-safe pymavlink wrapper for all flight-controller communication.
 """
 
 import math
+import queue
 import threading
 import time
 from typing import Any, Optional
@@ -36,6 +37,11 @@ class PixhawkLink:
         self._conn: Optional[Any] = None
         self._send_lock = threading.Lock()
         self._connected = False
+        self._telemetry_queue: Optional[queue.Queue] = None
+
+    def set_telemetry_queue(self, q: queue.Queue) -> None:
+        """Register a queue to receive raw MAVLink message bytes."""
+        self._telemetry_queue = q
 
     # ── Connection ─────────────────────────────────────────────────────
 
@@ -397,6 +403,11 @@ class PixhawkLink:
         try:
             msg = self._conn.recv_match(type=msg_type, blocking=True,
                                          timeout=timeout)
+            if msg is not None and self._telemetry_queue is not None:
+                try:
+                    self._telemetry_queue.put_nowait(msg.get_msgbuf())
+                except Exception:
+                    pass
             return msg
         except Exception:
             return None
@@ -414,6 +425,11 @@ class PixhawkLink:
             return None
         try:
             msg = self._conn.recv_match(blocking=True, timeout=timeout)
+            if msg is not None and self._telemetry_queue is not None:
+                try:
+                    self._telemetry_queue.put_nowait(msg.get_msgbuf())
+                except Exception:
+                    pass
             return msg
         except Exception:
             return None

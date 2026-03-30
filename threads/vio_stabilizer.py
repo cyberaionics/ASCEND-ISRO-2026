@@ -98,6 +98,9 @@ class MissionController:
         self._battery_volt: float = 0.0
         self._battery_pct: int = 0
 
+        # ── State Timers ──────────────────────────────────────────────
+        self._ground_touch_start: Optional[float] = None
+
         # ── Diagnostics ───────────────────────────────────────────────
         self._last_log: float = 0.0
 
@@ -370,28 +373,37 @@ class MissionController:
             pos_x = self._local_pos_x
             pos_y = self._local_pos_y
 
-        # Position error
-        err_x = Config.HOVER_TARGET_X - pos_x
-        err_y = Config.HOVER_TARGET_Y - pos_y
+        alt_m = self._tf02.distance_m
+        cmd_vx = 0.0
+        cmd_vy = 0.0
 
-        # Time step for integral
-        dt = now - self._last_pi_time
-        self._last_pi_time = now
-        if dt <= 0 or dt > 0.5:
-            dt = Config.MAIN_LOOP_INTERVAL
+        altitude_achieved = alt_m is not None and alt_m >= abs(Config.HOVER_TARGET_Z) * 0.95
 
-        # Integrate
-        self._integral_x += err_x * dt
-        self._integral_y += err_y * dt
+        if altitude_achieved:
+            # Position error
+            err_x = Config.HOVER_TARGET_X - pos_x
+            err_y = Config.HOVER_TARGET_Y - pos_y
 
-        # Anti-windup clamp
-        max_i = Config.POS_HOLD_INTEGRAL_MAX
-        self._integral_x = max(-max_i, min(max_i, self._integral_x))
-        self._integral_y = max(-max_i, min(max_i, self._integral_y))
+            # Time step for integral
+            dt = now - self._last_pi_time
+            self._last_pi_time = now
+            if dt <= 0 or dt > 0.5:
+                dt = Config.MAIN_LOOP_INTERVAL
 
-        # PI output → velocity command
-        cmd_vx = Config.POS_HOLD_KP * err_x + Config.POS_HOLD_KI * self._integral_x
-        cmd_vy = Config.POS_HOLD_KP * err_y + Config.POS_HOLD_KI * self._integral_y
+            # Integrate
+            self._integral_x += err_x * dt
+            self._integral_y += err_y * dt
+
+            # Anti-windup clamp
+            max_i = Config.POS_HOLD_INTEGRAL_MAX
+            self._integral_x = max(-max_i, min(max_i, self._integral_x))
+            self._integral_y = max(-max_i, min(max_i, self._integral_y))
+
+            # PI output → velocity command
+            cmd_vx = Config.POS_HOLD_KP * err_x + Config.POS_HOLD_KI * self._integral_x
+            cmd_vy = Config.POS_HOLD_KP * err_y + Config.POS_HOLD_KI * self._integral_y
+        else:
+            self._last_pi_time = now
 
         # ── Send position + velocity target ───────────────────────────
         self._px.send_position_target_local_ned_full(
@@ -453,11 +465,16 @@ class MissionController:
 
         # Touchdown detection
         if alt_m is not None and alt_m < Config.TOUCHDOWN_ALT_M:
-            if elapsed > 2.0:  # wait at least 2s to avoid false detection
-                Logger.ok(f"Touchdown at {alt_m:.2f}m — disarming")
+            if self._ground_touch_start is None:
+                self._ground_touch_start = now
+            elif now - self._ground_touch_start >= 1.0:
+                Logger.ok(f"Ground Touch confirmed for 1s at {alt_m:.2f}m — disarming")
                 self._px.disarm()
                 self._transition(MissionState.DONE)
-        elif elapsed > Config.LAND_DURATION_S + 5.0:
+        else:
+            self._ground_touch_start = None
+
+        if elapsed > Config.LAND_DURATION_S + 5.0 and self._state != MissionState.DONE:
             Logger.warn("Land timeout — force disarm")
             self._px.disarm()
             self._transition(MissionState.DONE)
