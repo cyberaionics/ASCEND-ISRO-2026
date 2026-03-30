@@ -33,7 +33,7 @@ from .config import Config
 from .logger import Logger
 from .hardware.tf02 import TF02Reader
 from .hardware.pixhawk import PixhawkLink
-from .hardware.wifi_flow import WiFiFrameReader, WiFiLKProcessor, WiFiORBProcessor
+from .hardware.wifi_flow import WiFiFrameReader, WiFiLKProcessor, WiFiORBProcessor, WhiteDetector
 from .threads.bridge import (
     HeartbeatSender,
     RangefinderBridge,
@@ -116,6 +116,15 @@ class StateMachine:
         self._ramp_throttle: int = Config.TAKEOFF_START_PWM
         self._current_throttle: int = Config.MIN_THROTTLE_PWM
 
+        # VIO drift tracking — accumulated X-Y displacement from takeoff
+        self._drift_x: float = 0.0
+        self._drift_y: float = 0.0
+        self._drift_last_time: float = 0.0
+
+        # White-pad detector
+        self._white_detector: Optional[WhiteDetector] = None
+        self._white_off_count: int = 0  # consecutive off-pad readings
+
     def get_telemetry(self) -> dict:
         """Build a telemetry dict for the TelemetryStreamer."""
         alt_m = self._tf02.distance_m
@@ -160,6 +169,11 @@ class StateMachine:
                             f"Safety trigger: {self._safety.emergency_reason}"
                         )
                         self._transition(State.LAND)
+
+                # Drift kill — immediate DISARM if drone drifts off board
+                if self._state in (State.TAKEOFF, State.HOVER):
+                    self._check_drift_kill()
+                    self._check_white_pad()
 
                 handler = {
                     State.IDLE:      self._state_idle,
@@ -230,6 +244,63 @@ class StateMachine:
                 return name
         return f"MODE_{custom_mode}"
 
+    # ── Drift Kill ─────────────────────────────────────────────────────
+
+    def _accumulate_drift(self) -> None:
+        """Integrate VIO velocity to track total X-Y drift from takeoff."""
+        if self._vio is None:
+            return
+        vx, vy = self._vio.get_velocity()
+        now = time.time()
+        if self._drift_last_time > 0:
+            dt = now - self._drift_last_time
+            if 0 < dt < 0.5:  # sanity check
+                self._drift_x += vx * dt
+                self._drift_y += vy * dt
+        self._drift_last_time = now
+
+    def _check_drift_kill(self) -> None:
+        """EMERGENCY DISARM if drone drifts beyond DRIFT_KILL_M."""
+        if not Config.DRIFT_KILL_ENABLED:
+            return
+        self._accumulate_drift()
+        drift_total = (self._drift_x ** 2 + self._drift_y ** 2) ** 0.5
+        if drift_total > Config.DRIFT_KILL_M:
+            Logger.error(
+                f"⚠ DRIFT KILL — drift={drift_total:.2f}m "
+                f"(x={self._drift_x:.2f}, y={self._drift_y:.2f}) "
+                f"> limit {Config.DRIFT_KILL_M}m — KILLING MOTORS"
+            )
+            self._px.clear_rc_override()
+            self._px.disarm()
+            self._running = False
+
+    def _check_white_pad(self) -> None:
+        """LAND if camera no longer sees white board underneath."""
+        if not Config.WHITE_CHECK_ENABLED:
+            return
+        if self._white_detector is None:
+            return
+        # Grace period: skip check right after takeoff
+        elapsed = time.time() - self._flight_start
+        if elapsed < Config.WHITE_GRACE_S:
+            return
+        # Skip if white detector data is stale
+        if self._white_detector.data_age > 2.0:
+            return
+
+        if not self._white_detector.is_over_white:
+            self._white_off_count += 1
+            if self._white_off_count >= 3:  # 3 consecutive readings (~0.6s)
+                Logger.error(
+                    f"⚠ WHITE PAD LOST — white_ratio="
+                    f"{self._white_detector.white_ratio:.2f} "
+                    f"< {Config.WHITE_MIN_RATIO} — LANDING NOW"
+                )
+                self._transition(State.LAND)
+        else:
+            self._white_off_count = 0
+
     # ── State Handlers (unchanged logic) ──────────────────────────────
 
     def _state_idle(self) -> None:
@@ -245,34 +316,56 @@ class StateMachine:
             self._transition(State.DONE)
 
     def _state_arm(self) -> None:
-        if not self._armed:
-            Logger.info("Arming …")
+        elapsed = time.time() - self._state_enter_time
+
+        # Send arm command only ONCE at the start — not every loop tick
+        if elapsed < 0.1:
+            Logger.info("Setting STABILIZE mode …")
             self._px.set_mode("STABILIZE")
-            time.sleep(0.3)
+
+        if elapsed > 0.5 and not self._armed and not getattr(self, '_arm_sent', False):
+            Logger.info("Sending ARM command …")
             self._px.arm()
+            self._arm_sent = True
+            Logger.info("Waiting for FC to confirm armed …")
 
         if self._armed:
-            Logger.ok("Armed")
+            Logger.ok("Armed successfully ✓")
+            self._arm_sent = False
             self._flight_start = time.time()
             self._safety.set_flight_active(True)
             self._transition(State.TAKEOFF)
-        elif time.time() - self._state_enter_time > Config.ARM_TIMEOUT_S:
-            Logger.error("Arm timeout")
+        elif elapsed > Config.ARM_TIMEOUT_S:
+            Logger.error(f"Arm timeout after {elapsed:.1f}s — check arming switches")
+            self._arm_sent = False
             self._transition(State.DONE)
 
     def _state_takeoff(self) -> None:
-        now  = time.time()
+        now     = time.time()
         elapsed = now - self._state_enter_time
 
-        # Ramp throttle
-        target_throttle = int(
-            Config.TAKEOFF_START_PWM
-            + Config.TAKEOFF_RAMP_PWM_PER_S * elapsed
+        # ── Throttle ramp: +10 PWM every 100 ms ──────────────────────
+        # On first entry, initialise ramp tracking variables.
+        if not hasattr(self, '_last_ramp_time'):
+            self._last_ramp_time = now
+            self._current_throttle = Config.TAKEOFF_START_PWM
+
+        # Increase throttle by TAKEOFF_RAMP_PWM_STEP every TAKEOFF_RAMP_INTERVAL
+        if now - self._last_ramp_time >= Config.TAKEOFF_RAMP_INTERVAL:
+            self._current_throttle += Config.TAKEOFF_RAMP_PWM_STEP
+            self._last_ramp_time = now
+
+        # Clamp to maximum allowed throttle
+        self._current_throttle = min(
+            self._current_throttle, Config.TAKEOFF_MAX_PWM
         )
-        self._current_throttle = min(target_throttle, Config.BASE_THROTTLE_PWM)
 
         roll_pwm  = self._vio.roll_pwm  if self._vio else 1500
         pitch_pwm = self._vio.pitch_pwm if self._vio else 1500
+
+        # Apply trim offsets to compensate for mechanical drift
+        roll_pwm  += Config.TRIM_ROLL_PWM
+        pitch_pwm += Config.TRIM_PITCH_PWM
 
         self._px.send_rc_override(
             throttle=self._current_throttle,
@@ -281,31 +374,65 @@ class StateMachine:
         )
 
         alt_m = self._tf02.distance_m
+        alt_str = f"{alt_m:.2f}m" if alt_m is not None else "---"
+
+        # Log throttle + altitude + VIO + velocity every second
+        if not hasattr(self, '_last_takeoff_log') or now - self._last_takeoff_log >= 1.0:
+            self._last_takeoff_log = now
+            vio_ok = self._vio.is_active if self._vio else False
+            vx, vy = self._vio.get_velocity() if self._vio else (0.0, 0.0)
+            Logger.info(
+                f"TAKEOFF | t={elapsed:.1f}s | "
+                f"throttle={self._current_throttle} PWM | "
+                f"alt={alt_str} | "
+                f"roll={roll_pwm} pitch={pitch_pwm} | "
+                f"VIO={'ON' if vio_ok else 'OFF'} | "
+                f"vel=({vx:+.3f}, {vy:+.3f}) m/s"
+            )
+
+        # Check if we reached target altitude
         if alt_m is not None:
             target = Config.HOVER_TARGET_ALT_M * Config.TAKEOFF_ALT_THRESHOLD
             if alt_m >= target:
-                Logger.ok(f"Takeoff reached {alt_m:.2f} m → HOVER")
+                Logger.ok(
+                    f"Takeoff complete — alt={alt_m:.2f}m "
+                    f"throttle={self._current_throttle} PWM → HOVER"
+                )
                 self._transition(State.HOVER)
 
+        # Timeout
         if elapsed > Config.TAKEOFF_TIMEOUT_S:
-            Logger.error("Takeoff timeout — landing")
+            Logger.error(
+                f"Takeoff timeout after {elapsed:.0f}s — "
+                f"max throttle was {self._current_throttle} PWM, "
+                f"alt={alt_str}. Increase TAKEOFF_MAX_PWM in config."
+            )
             self._transition(State.LAND)
 
     def _state_hover(self) -> None:
+        now = time.time()
         if self._hover_start is None:
-            self._hover_start = time.time()
+            self._hover_start = now
+
+        elapsed  = now - self._hover_start
+        remaining = Config.HOVER_DURATION_S - elapsed
 
         alt_m = self._tf02.distance_m
         if alt_m is None:
             throttle = Config.BASE_THROTTLE_PWM
+            alt_err  = 0.0
         else:
-            err      = Config.HOVER_TARGET_ALT_M - alt_m
-            throttle = int(Config.BASE_THROTTLE_PWM + Config.HOVER_KP_ALT * err)
+            alt_err  = Config.HOVER_TARGET_ALT_M - alt_m
+            throttle = int(Config.BASE_THROTTLE_PWM + Config.HOVER_KP_ALT * alt_err)
             throttle = max(Config.MIN_THROTTLE_PWM,
                            min(Config.MAX_THROTTLE_PWM, throttle))
 
         roll_pwm  = self._vio.roll_pwm  if self._vio else 1500
         pitch_pwm = self._vio.pitch_pwm if self._vio else 1500
+
+        # Apply trim offsets to compensate for mechanical drift
+        roll_pwm  += Config.TRIM_ROLL_PWM
+        pitch_pwm += Config.TRIM_PITCH_PWM
 
         self._px.send_rc_override(
             throttle=throttle,
@@ -313,16 +440,31 @@ class StateMachine:
             pitch=pitch_pwm,
         )
 
-        if time.time() - self._hover_start >= Config.HOVER_DURATION_S:
+        # Log hover status every second
+        if not hasattr(self, '_last_hover_log') or now - self._last_hover_log >= 1.0:
+            self._last_hover_log = now
+            alt_str = f"{alt_m:.2f}m" if alt_m is not None else "---"
+            vio_ok  = self._vio.is_active if self._vio else False
+            Logger.info(
+                f"HOVER  | t={elapsed:.0f}s | remain={remaining:.0f}s | "
+                f"alt={alt_str} (err={alt_err:+.2f}m) | "
+                f"throttle={throttle} PWM | "
+                f"roll={roll_pwm} pitch={pitch_pwm} | "
+                f"VIO={'ON' if vio_ok else 'OFF'}"
+            )
+
+        if elapsed >= Config.HOVER_DURATION_S:
             Logger.info("Hover complete → LAND")
             self._transition(State.LAND)
 
     def _state_land(self) -> None:
+        now = time.time()
         if self._land_start is None:
-            self._land_start = time.time()
+            self._land_start = now
             self._current_throttle = Config.BASE_THROTTLE_PWM
+            Logger.info("LAND sequence started")
 
-        elapsed = time.time() - self._land_start
+        elapsed = now - self._land_start
         self._current_throttle = int(
             Config.BASE_THROTTLE_PWM
             - Config.LAND_THROTTLE_DROP_PER_S * elapsed
@@ -337,9 +479,19 @@ class StateMachine:
         )
 
         alt_m = self._tf02.distance_m
+        alt_str = f"{alt_m:.2f}m" if alt_m is not None else "---"
+
+        # Log every second during landing
+        if not hasattr(self, '_last_land_log') or now - self._last_land_log >= 1.0:
+            self._last_land_log = now
+            Logger.info(
+                f"LAND   | t={elapsed:.1f}s | "
+                f"throttle={self._current_throttle} PWM | alt={alt_str}"
+            )
+
         if alt_m is not None and alt_m < Config.TOUCHDOWN_ALT_M:
             if elapsed > Config.LAND_DURATION_S * 0.5:
-                Logger.ok("Touchdown detected → DISARM")
+                Logger.ok(f"Touchdown detected at {alt_m:.2f}m → DISARM")
                 self._transition(State.DISARM)
         elif elapsed > Config.LAND_DURATION_S:
             Logger.info("Land timer expired → DISARM")
@@ -554,17 +706,14 @@ class Scheduler:
     def _start_wifi_cam(self) -> None:
         """Start WiFi frame reader + LK + ORB processors.
 
-        All three share a single HTTP connection to the ESP32-CAM MJPEG
-        stream.  If the stream is unreachable at startup the threads still
-        launch and will retry with exponential backoff.
+        WiFiFrameReader auto-discovers the ESP32-CAM on each connect
+        attempt (tries candidate IPs, then scans subnets).  All three
+        processors share a single HTTP connection.
         """
-        Logger.info(
-            f"Starting WiFi camera pipeline — "
-            f"URL: {Config.ESP32_WIFI_STREAM_URL}"
-        )
+        Logger.info("Starting WiFi camera pipeline — auto-discovery enabled")
         try:
-            # One connection — shared by both flow processors
-            self._wifi_frame = WiFiFrameReader(Config.ESP32_WIFI_STREAM_URL)
+            # One connection — auto-discovers ESP32-CAM IP
+            self._wifi_frame = WiFiFrameReader()  # no URL = auto-discover
             self._wifi_frame.start()
             self._threads.append(self._wifi_frame)
             Logger.ok("WiFiFrameReader started")
@@ -580,6 +729,12 @@ class Scheduler:
             self._wifi_orb.start()
             self._threads.append(self._wifi_orb)
             Logger.ok("WiFiORBProcessor started")
+
+            # White board detector (colour-based pad detection)
+            self._white_detector = WhiteDetector(self._wifi_frame)
+            self._white_detector.start()
+            self._threads.append(self._white_detector)
+            Logger.ok("WhiteDetector started")
 
         except Exception as exc:
             Logger.error(f"WiFi camera pipeline failed: {exc}")
